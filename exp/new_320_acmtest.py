@@ -16,8 +16,8 @@ import matplotlib.pyplot as plt
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 这里要改：用 24->24 的 wrapper
-from data_provider.data_loader_acm_320 import FlightDataset_acm, Dataset_Forecast24to24_From96
+# 用 24->24 的 wrapper（base 现在是 [keep_len, D]，比如 480）
+from data_provider.data_loader_acm_320 import FlightDataset_acm, Dataset_Forecast24to24_FromSegHead
 from models.timer_xl import Model as TimerXL
 
 
@@ -73,14 +73,15 @@ def _build_model_and_optim(args, device):
 
 
 # =========================================================
-# 1) train/val split：只在 train_normal 的窗口池里 split
-#    注意：base_all 的 seq_len=96，但 full_ds 是 24->24 的样本集合
+# 1) train/val split：只在 train_normal 的样本池里 split
+#    base_all: 每条是 [keep_len, 6]（如 480）
+#    full_ds: 24->24 切片集合
 # =========================================================
 def _build_loaders(args, logger):
     base_all = FlightDataset_acm(args, Tag="train_normal", side=args.side)
 
-    # 关键：24->24 切片 wrapper
-    full_ds = Dataset_Forecast24to24_From96(
+    # 关键：24->24 切片 wrapper（从 seg head 的 keep_len 中切）
+    full_ds = Dataset_Forecast24to24_FromSegHead(
         base_all,
         in_len=args.in_len,
         out_len=args.out_len,
@@ -117,10 +118,13 @@ def _build_loaders(args, logger):
         pin_memory=True
     )
 
-    # 打印你到底是不是 24->24
-    logger.info("[Config] base_seq_len=%d | in_len=%d -> out_len=%d | stride=%d",
-                int(args.seq_len), int(args.in_len), int(args.out_len), int(args.stride))
-    logger.info("Total train_normal base windows = %d", len(base_all))
+    base_len = int(base_all.data.shape[1]) if len(base_all) > 0 else -1
+    logger.info("[Config] base_len=%d (keep=%dx%d=%d) | in_len=%d -> out_len=%d | stride=%d",
+                base_len,
+                int(args.max_windows_per_flight), int(args.seq_len),
+                int(args.max_windows_per_flight) * int(args.seq_len),
+                int(args.in_len), int(args.out_len), int(args.stride))
+    logger.info("Total train_normal segheads = %d", len(base_all))
     logger.info("Total 24->24 samples (after slicing) = %d", len(full_ds))
     logger.info("Train samples = %d | Val samples = %d", len(train_ds), len(val_ds))
     logger.info("Feature names = %s", getattr(base_all, "feature_names", None))
@@ -154,11 +158,11 @@ def _eval_on_subset_24to24(args, logger, ckpt_path, subset, tag: str):
         x = batch_x.to(device).reshape(-1, L, C)      # [B,24,6]
         y = batch_y.to(device).reshape(-1, L, 1)      # [B,24,1]
 
-        out_all = model(x)                            # 预期输出含时间维 L
-        pred = out_all[:, -1, :].unsqueeze(-1)        # [B,24,1] 兼容你原来的写法
+        out_all = model(x)
+        pred = out_all[:, -1, :].unsqueeze(-1)        # [B,24,1] (按你原写法取最后层输出)
 
-        p = pred.detach().cpu().numpy().astype(np.float32)  # [B,24,1]
-        t = y.detach().cpu().numpy().astype(np.float32)     # [B,24,1]
+        p = pred.detach().cpu().numpy().astype(np.float32)
+        t = y.detach().cpu().numpy().astype(np.float32)
 
         mse_list.extend(((p - t) ** 2).mean(axis=(1, 2)).tolist())
         mae_list.extend(np.abs(p - t).mean(axis=(1, 2)).tolist())
@@ -181,7 +185,6 @@ def _save_train_curves(save_dir: str, df: pd.DataFrame, setting: str):
     csv_path = os.path.join(save_dir, "train_curve.csv")
     df.to_csv(csv_path, index=False)
 
-    # loss curve png
     plt.figure()
     plt.plot(df["epoch"].values, df["train_loss"].values, label="train_loss")
     plt.plot(df["epoch"].values, df["val_loss"].values, label="val_loss")
@@ -270,7 +273,6 @@ def train_timerxl_forecast24to24(args):
             "n_val": int(len(val_ds)),
         })
 
-        # save curve each epoch (方便中途挂了也有记录)
         curve_df = pd.DataFrame(curve_rows)
         _save_train_curves(save_dir, curve_df, args.setting)
 
@@ -296,7 +298,7 @@ def evaluate_timerxl_forecast24to24(args, ckpt_path):
     logger.info("Evaluating on test_normal_recent ...")
     base_nr = FlightDataset_acm(args, Tag="test_normal_recent", side=args.side)
     if len(base_nr) > 0:
-        ds_nr = Dataset_Forecast24to24_From96(base_nr, in_len=args.in_len, out_len=args.out_len, stride=args.stride)
+        ds_nr = Dataset_Forecast24to24_FromSegHead(base_nr, in_len=args.in_len, out_len=args.out_len, stride=args.stride)
         _eval_on_subset_24to24(args, logger, ckpt_path, ds_nr, tag="test_normal_recent")
     else:
         logger.warning("No test_normal_recent data found, skip.")
@@ -304,7 +306,7 @@ def evaluate_timerxl_forecast24to24(args, ckpt_path):
     logger.info("Evaluating on test_abnormal ...")
     base_abn = FlightDataset_acm(args, Tag="test_abnormal", side=args.side)
     if len(base_abn) > 0:
-        ds_abn = Dataset_Forecast24to24_From96(base_abn, in_len=args.in_len, out_len=args.out_len, stride=args.stride)
+        ds_abn = Dataset_Forecast24to24_FromSegHead(base_abn, in_len=args.in_len, out_len=args.out_len, stride=args.stride)
         _eval_on_subset_24to24(args, logger, ckpt_path, ds_abn, tag="test_abnormal")
     else:
         logger.warning("No abnormal data found, skip.")
@@ -320,10 +322,10 @@ if __name__ == "__main__":
 
     base_args = Args()
 
-    # base window（用于缓存）：仍然用 96
+    # base window（96） + 只保留每个航段前 max_windows_per_flight 个 window => keep_len=96*5=480
     base_args.seq_len = 96
 
-    # 24->24 的训练切片参数（用于确认是否用了 24->24）
+    # 24->24 的训练切片参数
     base_args.in_len = 24
     base_args.out_len = 24
     base_args.stride = 24
@@ -351,7 +353,7 @@ if __name__ == "__main__":
     base_args.val_ratio = 0.1
     base_args.split_seed = 42
 
-    # 每个航段取多少个 base window（
+    # 每个航段取多少个 base window（keep_len = max_windows_per_flight * seq_len）
     base_args.max_windows_per_flight = 5
 
     # Paths
@@ -363,12 +365,12 @@ if __name__ == "__main__":
     base_args.fault_gap_months = 6
     base_args.normal_anchor_end = "2025-08-01"
 
-    # raw 两年缓存参数
+    # raw 缓存参数
     base_args.raw_months = 12
     base_args.raw_end_use_gap = False  # True: raw_end = fd-gap_months；False: raw_end=fd
 
-    # raw verbose（想看更细 print 就打开）
-    base_args.verbose_raw =  True  
+    # raw verbose
+    base_args.verbose_raw = True
     base_args.verbose_every_n_param = 1
     base_args.verbose_flush = True
 
@@ -380,6 +382,7 @@ if __name__ == "__main__":
 
     base_setting = (
         f"timerxl_forecast_in{base_args.in_len}_out{base_args.out_len}_stride{base_args.stride}_"
+        f"keep{base_args.max_windows_per_flight}x{base_args.seq_len}_"
         f"raw{base_args.raw_months}m_train{base_args.normal_months}m_test{base_args.test_normal_months}m_"
         f"gap{base_args.fault_gap_months}m_{base_args.normal_anchor_end}end_noALTSTD"
     )
@@ -395,7 +398,8 @@ if __name__ == "__main__":
         print("\n==============================")
         print(
             f"Running side={side} | setting={args.setting} | "
-            f"base_seq_len={args.seq_len} | in={args.in_len} out={args.out_len} stride={args.stride} | "
+            f"base_seq_len={args.seq_len} | keep={args.max_windows_per_flight}x{args.seq_len} | "
+            f"in={args.in_len} out={args.out_len} stride={args.stride} | "
             f"rawM={args.raw_months} trainM={args.normal_months} testM={args.test_normal_months} gapM={args.fault_gap_months} "
             f"anchor_end(no-fault)={args.normal_anchor_end} raw_end_use_gap={args.raw_end_use_gap} | "
             f"max_windows_per_flight={args.max_windows_per_flight}"
