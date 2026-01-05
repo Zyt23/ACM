@@ -64,14 +64,12 @@ try:
         _fault_df["side"] = pd.NA
         _fault_df["pack"] = pd.NA
 
-    # 所有故障（不分侧）
     fault_dates_by_tail = (
         _fault_df.groupby("机号")["首发日期"]
         .apply(lambda s: sorted(pd.to_datetime(s, errors="coerce").dropna().unique()))
         .to_dict()
     )
 
-    # PACK1 故障日期
     fault_dates_by_tail_pack1 = (
         _fault_df[_fault_df["pack"] == 1]
         .groupby("机号")["首发日期"]
@@ -79,7 +77,6 @@ try:
         .to_dict()
     )
 
-    # PACK2 故障日期
     fault_dates_by_tail_pack2 = (
         _fault_df[_fault_df["pack"] == 2]
         .groupby("机号")["首发日期"]
@@ -93,6 +90,7 @@ except FileNotFoundError:
     fault_dates_by_tail_pack1 = {}
     fault_dates_by_tail_pack2 = {}
 
+
 def _get_fault_dates_for_tail_side(tail_num: str, side_key: str):
     """给定机号和 side_key ('PACK1' / 'PACK2')，取该侧的故障日期列表"""
     if side_key == "PACK1":
@@ -100,6 +98,7 @@ def _get_fault_dates_for_tail_side(tail_num: str, side_key: str):
     elif side_key == "PACK2":
         return fault_dates_by_tail_pack2.get(tail_num, [])
     return []
+
 
 # =========================================================
 # 3. 参数列表：PACK1 / PACK2（完全删除 ALT_STD）
@@ -122,6 +121,7 @@ PACK2_PARA = [
 ]
 PARAMS_BY_SIDE = {"PACK1": PACK1_PARA, "PACK2": PACK2_PARA}
 
+
 # =========================================================
 # 4. 插值工具
 # =========================================================
@@ -138,6 +138,7 @@ def interpolate_to_grid(df_src: pd.DataFrame, grid_time_ns: np.ndarray, col_name
     y = y[idx]
 
     return np.interp(grid_time_ns.astype(np.int64), x, y, left=y[0], right=y[-1])
+
 
 # =========================================================
 # 5. 时间切分规则（你的版本）
@@ -197,6 +198,7 @@ def get_time_range_for_tail(
 
     raise ValueError(f"Unknown mode: {mode}")
 
+
 # =========================================================
 # 6. verbose print（可控）
 # =========================================================
@@ -205,6 +207,25 @@ def _vprint(args, *msg):
         return
     flush = bool(getattr(args, "verbose_flush", True))
     print(*msg, flush=flush)
+
+
+# =========================================================
+# 6.1 Dataset debug print（更粗粒度）
+# =========================================================
+def _dprint(args, *msg):
+    """数据集构建阶段的 debug 打印（不依赖 verbose_raw）"""
+    if not bool(getattr(args, "verbose_ds", True)):
+        return
+    flush = bool(getattr(args, "verbose_flush", True))
+    print(*msg, flush=flush)
+
+
+def _fmt_dt_ns(ns: int):
+    try:
+        return str(pd.to_datetime(int(ns), unit="ns", utc=True).tz_convert("Asia/Shanghai"))
+    except Exception:
+        return "NA"
+
 
 # =========================================================
 # 7. 方案A：raw npz 固定按 tail+side+统一 raw_months 范围缓存
@@ -215,10 +236,12 @@ def _feat_hash(feat_cols):
     s = ",".join([str(c) for c in feat_cols]).encode("utf-8")
     return hashlib.md5(s).hexdigest()[:10]
 
+
 def _raw_cache_dir():
     d = os.path.join(_PROJECT_ROOT, "cache", "acm_raw_2y_v2_no_object")
     os.makedirs(d, exist_ok=True)
     return d
+
 
 def get_raw_2y_range_for_tail(
     tail_num: str,
@@ -243,6 +266,7 @@ def get_raw_2y_range_for_tail(
         raw_end = pd.Timestamp(anchor_end_str).normalize()
     raw_start = (raw_end - pd.DateOffset(months=raw_months)).normalize()
     return raw_start, raw_end
+
 
 def load_or_build_raw_npz_2y(
     session,
@@ -401,17 +425,49 @@ def load_or_build_raw_npz_2y(
 
     return time_ns, X, [str(c) for c in feat_cols]
 
-def slice_raw_by_time_range(time_ns: np.ndarray, X: np.ndarray, start_ts_ns: int, end_ts_ns: int):
-    """用 searchsorted 在已排序 time_ns 上裁剪到 [start_ts_ns, end_ts_ns)"""
+
+def slice_raw_by_time_range(
+    time_ns: np.ndarray,
+    X: np.ndarray,
+    start_ts_ns: int,
+    end_ts_ns: int,
+    args=None,
+    tail="",
+    side="",
+    mode="",
+):
+    """用 searchsorted 在已排序 time_ns 上裁剪到 [start_ts_ns, end_ts_ns)，带更细日志"""
     if len(time_ns) == 0:
+        if args is not None:
+            _dprint(args, f"[SLICE][{tail}][{side}][{mode}] raw empty -> slice empty")
         return time_ns, X
+
     l = int(np.searchsorted(time_ns, start_ts_ns, side="left"))
     r = int(np.searchsorted(time_ns, end_ts_ns, side="left"))
-    l = max(0, min(l, len(time_ns)))
-    r = max(0, min(r, len(time_ns)))
-    if r <= l:
+    l2 = max(0, min(l, len(time_ns)))
+    r2 = max(0, min(r, len(time_ns)))
+
+    if args is not None:
+        _dprint(args, f"[SLICE][{tail}][{side}][{mode}] start={_fmt_dt_ns(start_ts_ns)} end={_fmt_dt_ns(end_ts_ns)}")
+        _dprint(args, f"[SLICE][{tail}][{side}][{mode}] searchsorted l={l} r={r} | clipped l2={l2} r2={r2} | raw_T={len(time_ns)}")
+        _dprint(args, f"[SLICE][{tail}][{side}][{mode}] raw_first={_fmt_dt_ns(time_ns[0])} raw_last={_fmt_dt_ns(time_ns[-1])}")
+
+        if start_ts_ns >= time_ns[-1]:
+            _dprint(args, f"[SLICE][{tail}][{side}][{mode}] !!! mode_start >= raw_last -> WILL BE EMPTY")
+        if end_ts_ns <= time_ns[0]:
+            _dprint(args, f"[SLICE][{tail}][{side}][{mode}] !!! mode_end <= raw_first -> WILL BE EMPTY")
+
+    if r2 <= l2:
+        if args is not None:
+            _dprint(args, f"[SLICE][{tail}][{side}][{mode}] RESULT empty (r2<=l2)")
         return np.array([], dtype=np.int64), np.zeros((0, X.shape[1]), dtype=X.dtype)
-    return time_ns[l:r], X[l:r]
+
+    out_t = time_ns[l2:r2]
+    out_x = X[l2:r2]
+    if args is not None:
+        _dprint(args, f"[SLICE][{tail}][{side}][{mode}] RESULT T={len(out_t)} | first={_fmt_dt_ns(out_t[0])} last={_fmt_dt_ns(out_t[-1])}")
+    return out_t, out_x
+
 
 def recompute_segments_from_time(time_ns: np.ndarray, gap_threshold_sec: float):
     """在裁剪后的 time_ns 上重新按 gap_threshold_sec 切航段"""
@@ -426,6 +482,7 @@ def recompute_segments_from_time(time_ns: np.ndarray, gap_threshold_sec: float):
             start_idx = i
     segments.append((start_idx, len(time_ns)))
     return np.array(segments, dtype=np.int32)
+
 
 # =========================================================
 # 8. 航段开始可视化（每段取 96*5=480 点，多变量，一张图）
@@ -481,6 +538,7 @@ def plot_segment_starts(
     plt.savefig(out_png, dpi=160)
     plt.close(fig)
 
+
 def print_first_steps(
     time_ns: np.ndarray,
     X: np.ndarray,
@@ -500,6 +558,7 @@ def print_first_steps(
     df.insert(0, "time", t.astype(str))
     print(f"\n[Preview] {tail} {side} {mode} first {take} rows:")
     print(df.head(take).to_string(index=False))
+
 
 # =========================================================
 # 9. A320 PACK 数据集：FlightDataset_acm（支持 PACK1 / PACK2）
@@ -707,6 +766,8 @@ class FlightDataset_acm(Dataset):
 
         for tail_num in tqdm(tail_list, desc=f"[A320-{mode}-{self.side}] Fetching..."):
             print(f"\n--- [{tail_num}] 开始处理 (mode={mode}, side={self.side}) ---")
+            _dprint(self.args, f"[DS][{tail_num}][{self.side}][{mode}] train_months={self.train_months} test_months={self.test_normal_months} gap_months={self.fault_gap_months} anchor_end={self.normal_anchor_end}")
+            _dprint(self.args, f"[DS][{tail_num}][{self.side}][{mode}] raw_months={self.raw_months} raw_end_use_gap={self.raw_end_use_gap} gap_threshold_sec={gap_threshold_sec} seq_len={seq_len} max_windows_per_flight={max_windows_per_flight}")
 
             # 当前 mode 的切片范围
             start_date, end_date = get_time_range_for_tail(
@@ -752,19 +813,38 @@ class FlightDataset_acm(Dataset):
             t_raw1 = time.time()
             print(f"[Perf][{tail_num}] raw load/build: {t_raw1 - t_raw0:.3f}s | T_raw={len(time_ns_raw)}")
 
+            if len(time_ns_raw) > 0:
+                _dprint(self.args, f"[RAWSTAT][{tail_num}][{self.side}] raw_first={_fmt_dt_ns(time_ns_raw[0])} raw_last={_fmt_dt_ns(time_ns_raw[-1])}")
+
             if len(time_ns_raw) == 0 or X_raw.shape[0] == 0:
                 print(f"  !!! raw为空, 跳过 {tail_num}")
                 continue
 
-            # mode 时间裁剪
-            time_ns, X = slice_raw_by_time_range(time_ns_raw, X_raw, start_ts_ns_mode, end_ts_ns_mode)
+            # mode 时间裁剪（带更细日志）
+            time_ns, X = slice_raw_by_time_range(
+                time_ns_raw, X_raw,
+                start_ts_ns_mode, end_ts_ns_mode,
+                args=self.args, tail=tail_num, side=self.side, mode=mode
+            )
             print(f"[Perf][{tail_num}] mode slice: T={len(time_ns)}")
+
+            if len(time_ns) == 0:
+                _dprint(self.args, f"[WHYEMPTY][{tail_num}][{self.side}][{mode}] mode range has 0 points. "
+                                   f"Usually raw range does NOT cover this mode range OR master_param has no data in this month.")
+
             if len(time_ns) < seq_len:
                 print(f"  !!! 裁剪后长度<{seq_len}, 跳过")
                 continue
 
-            # 裁剪后重切航段
+            # 裁剪后重切航段 + 打印段分布
             segments = recompute_segments_from_time(time_ns, gap_threshold_sec=gap_threshold_sec)
+            seg_lens = [int(e) - int(s) for (s, e) in segments.tolist()]
+            if len(seg_lens) > 0:
+                _dprint(self.args, f"[SEG][{tail_num}][{self.side}][{mode}] segments_total={len(seg_lens)} | len_min={min(seg_lens)} len_med={int(np.median(seg_lens))} len_max={max(seg_lens)}")
+                for ii, (s, e) in enumerate(segments.tolist()[:5]):
+                    s = int(s); e = int(e)
+                    _dprint(self.args, f"[SEG][{tail_num}] seg#{ii} idx=[{s},{e}) len={e-s} t0={_fmt_dt_ns(time_ns[s])} t1={_fmt_dt_ns(time_ns[e-1])}")
+
             valid_segments = [(int(s), int(e)) for (s, e) in segments.tolist() if (int(e) - int(s)) >= seq_len]
             print(f"[Perf][{tail_num}] segments={len(valid_segments)} after filter")
             if len(valid_segments) == 0:
@@ -797,11 +877,19 @@ class FlightDataset_acm(Dataset):
             for (s, e) in valid_segments:
                 seg_len = e - s
                 max_k = min(max_windows_per_flight, seg_len // seq_len)
+                _dprint(self.args, f"[WIN][{tail_num}][{self.side}][{mode}] seg idx=[{s},{e}) len={seg_len} -> can_cut={seg_len//seq_len} use={max_k}")
+
                 for k in range(max_k):
                     st = s + k * seq_len
                     ed = st + seq_len
                     if ed > e:
                         break
+
+                    if k == 0:
+                        t_st = _fmt_dt_ns(time_ns[st])
+                        t_ed = _fmt_dt_ns(time_ns[ed - 1])
+                        _dprint(self.args, f"[WIN][{tail_num}] first_window_time {t_st} --> {t_ed}")
+
                     window = X[st:ed, :]  # [L,D]
                     all_seqs.append(window.astype(np.float32))
 
@@ -829,6 +917,7 @@ class FlightDataset_acm(Dataset):
     def __len__(self):
         return len(self.data)
 
+
 # =========================================================
 # 10. TimerXL 回归包装：Dataset_RegRight_TimerXL（6 通道输入）
 # =========================================================
@@ -854,13 +943,13 @@ class Dataset_RegRight_TimerXL(Dataset):
                 "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
                 "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
             ]
-            target_name = "PACK1_COMPR_T"
+            target_name = "PACK1_DISCH_T"
         else:
             self.input_names = [
                 "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
                 "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
             ]
-            target_name = "PACK2_COMPR_T"
+            target_name = "PACK2_DISCH_T"
 
         need = self.input_names + [target_name]
         miss = [c for c in need if c not in n2i]
@@ -878,6 +967,7 @@ class Dataset_RegRight_TimerXL(Dataset):
         x = torch.from_numpy(arr[:, self.idx_x]).float()                 # [L,6]
         y = torch.from_numpy(arr[:, self.idx_y:self.idx_y + 1]).float()  # [L,1]
         return x.unsqueeze(0), y.unsqueeze(0), torch.tensor([idx], dtype=torch.long)
+
 
 # =========================================================
 # 11) 轻量预览 main：不构建全量 dataset，只拉 raw + 切片 + 可视化
@@ -964,8 +1054,8 @@ class Dataset_Forecast24to24_From96(Dataset):
         st = sub_id * self.stride
 
         arr = self.base[base_idx]  # [96, 6]
-        x = arr[st:st+self.in_len, self.idx_x]  # [24,6]
-        y = arr[st+self.in_len:st+self.in_len+self.out_len, self.idx_y]  # [24]
+        x = arr[st:st + self.in_len, self.idx_x]  # [24,6]
+        y = arr[st + self.in_len:st + self.in_len + self.out_len, self.idx_y]  # [24]
 
         x = torch.from_numpy(x).float().unsqueeze(0)                # [1,24,6]
         y = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1)  # [1,24,1]
@@ -978,7 +1068,7 @@ def preview_tails_without_building_dataset(
     side="PACK2",
     mode="train_normal",
     seq_len=96,
-    n_steps=96*5,
+    n_steps=96 * 5,
     raw_months=24,
     fault_gap_months=6,
     test_months=1,
@@ -998,8 +1088,10 @@ def preview_tails_without_building_dataset(
     """
     class Args:
         pass
+
     args = Args()
     args.verbose_raw = bool(verbose)
+    args.verbose_ds = True
     args.verbose_flush = True
     args.verbose_every_n_param = 1
 
@@ -1014,7 +1106,6 @@ def preview_tails_without_building_dataset(
         print(f"[Preview] tail={tail} side={side} mode={mode}")
         print("==============================")
 
-        # mode 的 start/end（用同一套规则）
         start_date, end_date = get_time_range_for_tail(
             tail_num=tail,
             mode=mode if mode in ("train_normal", "test_normal", "abnormal") else "train_normal",
@@ -1054,12 +1145,15 @@ def preview_tails_without_building_dataset(
         )
         print(f"[Preview] raw loaded: T={len(time_ns_raw)} X={X_raw.shape}")
 
-        time_ns, X = slice_raw_by_time_range(time_ns_raw, X_raw, start_ts_ns_mode, end_ts_ns_mode)
+        time_ns, X = slice_raw_by_time_range(
+            time_ns_raw, X_raw,
+            start_ts_ns_mode, end_ts_ns_mode,
+            args=args, tail=tail, side=side, mode=mode
+        )
         print(f"[Preview] sliced: T={len(time_ns)} X={X.shape}")
         if len(time_ns) == 0:
             continue
 
-        # 打印前 n_steps 行（避免太大）
         print_first_steps(
             time_ns=time_ns,
             X=X,
@@ -1071,8 +1165,7 @@ def preview_tails_without_building_dataset(
         )
 
         segments = recompute_segments_from_time(time_ns, gap_threshold_sec=float(gap_threshold_sec))
-        # 过滤太短的段
-        valid = [(int(s), int(e)) for (s, e) in segments.tolist() if (int(e)-int(s)) >= int(seq_len)]
+        valid = [(int(s), int(e)) for (s, e) in segments.tolist() if (int(e) - int(s)) >= int(seq_len)]
         print(f"[Preview] segments total={len(segments)} valid(>={seq_len})={len(valid)}")
         if len(valid) == 0:
             continue
@@ -1092,19 +1185,14 @@ def preview_tails_without_building_dataset(
         )
         print(f"[Preview] plot saved: {out_png}")
 
-if __name__ == "__main__":
-    # 直接运行本文件：只预览几个 tail，不构建全量 dataset
-    # 用法示例：
-    #   python data_provider/data_loader_acm_320.py
-    #
-    # 你可以在这里改 tails / side / mode
 
+if __name__ == "__main__":
     preview_tails_without_building_dataset(
         tails=["B-301A", "B-301G"],
         side="PACK2",
         mode="train_normal",      # "train_normal" / "test_normal" / "abnormal"
         seq_len=96,
-        n_steps=96*5,
+        n_steps=96 * 5,
         raw_months=24,
         fault_gap_months=6,
         test_months=1,

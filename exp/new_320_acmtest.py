@@ -16,136 +16,13 @@ import matplotlib.pyplot as plt
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data_provider.data_loader_acm_320 import FlightDataset_acm, Dataset_RegRight_TimerXL
+# 这里要改：用 24->24 的 wrapper
+from data_provider.data_loader_acm_320 import FlightDataset_acm, Dataset_Forecast24to24_From96
 from models.timer_xl import Model as TimerXL
 
-# =========================================================
-# 0) 报警逻辑（保持不变）
-# =========================================================
-configs = {"length": 6, "end_point_idx": 100, "window_size": 35}
-
-def calculate_mean_up(df: pd.DataFrame) -> pd.DataFrame:
-    length_threshold = configs["length"]
-    end_point_idx = configs["end_point_idx"]
-
-    df["non_negative"] = df["mean_diff"] >= 0
-    df["sequence_group"] = (df["non_negative"] != df["non_negative"].shift(1)).cumsum()
-    sequence_lengths = df.groupby("sequence_group").size()
-
-    for group_id, length in sequence_lengths.items():
-        is_nonneg_segment = bool(df[df["sequence_group"] == group_id]["non_negative"].iloc[0])
-        if length >= length_threshold and is_nonneg_segment:
-            sequence_indices = df[df["sequence_group"] == group_id].index
-            if len(sequence_indices) == 0:
-                continue
-            first_point_idx = sequence_indices[0]
-            start_idx = max(0, first_point_idx - end_point_idx)
-            search_means = df.loc[list(range(start_idx, first_point_idx + 1)), "mean"]
-            if search_means.empty:
-                continue
-            min_mean = float(search_means.min())
-            for idx in sequence_indices:
-                current_mean = float(df.loc[idx, "mean"])
-                df.loc[idx, "mean_up"] = (current_mean / min_mean) if min_mean != 0 else 1.0
-
-    df.drop(columns=["non_negative", "sequence_group", "mean_diff"], inplace=True)
-    return df
-
-def find_warning_condition(df_max: pd.DataFrame) -> pd.DataFrame:
-    df_max = df_max.copy()
-    if "loss" not in df_max.columns:
-        df_max["mean"] = np.nan
-        df_max["mean_up"] = np.nan
-        return df_max
-
-    window_size = configs["window_size"]
-    df_max["mean"] = 0.0
-    df_max["mean_diff"] = np.nan
-    df_max["mean_up"] = 0.0
-
-    if len(df_max) >= window_size:
-        df_max.loc[window_size - 1 :, "mean"] = np.nan
-    df_max.loc[: min(window_size - 2, len(df_max) - 1), "mean"] = float(
-        np.mean(df_max["loss"].iloc[: window_size - 1])
-    )
-
-    for i in range(len(df_max)):
-        if i >= window_size - 1:
-            window_data = df_max.iloc[i - window_size + 1 : i + 1]
-            df_max.loc[df_max.index[i], "mean"] = float(np.mean(window_data["loss"]))
-
-    df_max["mean_diff"] = df_max["mean"].diff()
-    df_max = calculate_mean_up(df_max)
-    return df_max
-
-def alarm_from_loss_series(tail: str, loss_df: pd.DataFrame, save_dir: str, tag: str,
-                           threshold: float = 0.5, keep_last_n: int = 300):
-    os.makedirs(save_dir, exist_ok=True)
-
-    df = loss_df.copy()
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-
-    hist_path = os.path.join(save_dir, f"loss_{tag}_{tail}.csv")
-    if os.path.exists(hist_path):
-        old = pd.read_csv(hist_path)
-        if len(old) > 0:
-            old["time"] = pd.to_datetime(old["time"], errors="coerce")
-            old = old.dropna(subset=["time"])
-    else:
-        old = pd.DataFrame(columns=["time", "loss"])
-
-    new_loss = pd.concat([old, df[["time", "loss"]]], ignore_index=True)
-    new_loss = new_loss.sort_values("time").drop_duplicates(subset=["time"], keep="last")
-    new_loss = new_loss.tail(keep_last_n).reset_index(drop=True)
-    new_loss.to_csv(hist_path, index=False)
-
-    if len(new_loss) <= 40:
-        return None, False, None, new_loss
-
-    out = find_warning_condition(new_loss.rename(columns={"loss": "loss"}))
-    if "mean_up" not in out.columns:
-        return None, False, None, out
-
-    final_mean_up = float(out["mean_up"].iloc[-1])
-    is_alarm = final_mean_up > threshold
-
-    first_alarm_time = None
-    if is_alarm:
-        hits = out[out["mean_up"] > threshold]
-        if len(hits) > 0:
-            first_alarm_time = pd.to_datetime(hits["time"].iloc[0], errors="coerce")
-
-    return final_mean_up, is_alarm, first_alarm_time, out
 
 # =========================================================
-# 1) fault side csv：用于给每个 tail 关联“本侧故障日期”
-# =========================================================
-def load_fault_map_for_side(side_pack: str) -> dict:
-    csv_path = os.path.join("data_provider", "320_ACM_faults_side.csv")
-    if not os.path.exists(csv_path):
-        print(f"[WARN] fault_side csv not found: {csv_path}")
-        return {}
-
-    df = pd.read_csv(csv_path)
-    need = {"机号", "首发日期", "pack"}
-    if not need.issubset(set(df.columns)):
-        print(f"[WARN] fault_side csv columns mismatch. Need={need}, Got={set(df.columns)}")
-        return {}
-
-    df["首发日期"] = pd.to_datetime(df["首发日期"], errors="coerce")
-    df = df.dropna(subset=["机号", "首发日期", "pack"])
-    df["pack"] = pd.to_numeric(df["pack"], errors="coerce").astype("Int64")
-
-    pack_id = 1 if side_pack == "PACK1" else 2
-    df = df[df["pack"] == pack_id].copy()
-    if len(df) == 0:
-        return {}
-
-    return df.groupby("机号")["首发日期"].min().to_dict()
-
-# =========================================================
-# 2) TimerXL 配置 & logger
+# 0) TimerXL 配置 & logger
 # =========================================================
 class TimerXLConfigs:
     def __init__(self, args):
@@ -160,6 +37,7 @@ class TimerXLConfigs:
         self.covariate = False
         self.flash_attention = False
         self.use_norm = False
+
 
 def setup_logger(setting: str):
     os.makedirs("logs", exist_ok=True)
@@ -178,20 +56,36 @@ def setup_logger(setting: str):
     logger.addHandler(ch)
     return logger
 
+
 def _build_model_and_optim(args, device):
     cfg = TimerXLConfigs(args)
     model = TimerXL(cfg).to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.tmax, eta_min=1e-8) if args.cosine else None
+    optim = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay
+    )
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optim, T_max=args.tmax, eta_min=1e-8
+    ) if args.cosine else None
     criterion = nn.MSELoss()
     return model, optim, sched, criterion
 
+
 # =========================================================
-# 3) train/val split：只在 train_normal 这段窗口池里 split
+# 1) train/val split：只在 train_normal 的窗口池里 split
+#    注意：base_all 的 seq_len=96，但 full_ds 是 24->24 的样本集合
 # =========================================================
-def _build_loaders(args):
+def _build_loaders(args, logger):
     base_all = FlightDataset_acm(args, Tag="train_normal", side=args.side)
-    full_ds = Dataset_RegRight_TimerXL(base_all)
+
+    # 关键：24->24 切片 wrapper
+    full_ds = Dataset_Forecast24to24_From96(
+        base_all,
+        in_len=args.in_len,
+        out_len=args.out_len,
+        stride=args.stride
+    )
 
     n_total = len(full_ds)
     if n_total == 0:
@@ -208,115 +102,105 @@ def _build_loaders(args):
 
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    # 打印你到底是不是 24->24
+    logger.info("[Config] base_seq_len=%d | in_len=%d -> out_len=%d | stride=%d",
+                int(args.seq_len), int(args.in_len), int(args.out_len), int(args.stride))
+    logger.info("Total train_normal base windows = %d", len(base_all))
+    logger.info("Total 24->24 samples (after slicing) = %d", len(full_ds))
+    logger.info("Train samples = %d | Val samples = %d", len(train_ds), len(val_ds))
+    logger.info("Feature names = %s", getattr(base_all, "feature_names", None))
 
     return base_all, full_ds, train_ds, val_ds, train_loader, val_loader
 
+
 # =========================================================
-# 4) eval（保持你的逻辑，仅适配输入C=6）
+# 2) eval：按 24->24 计算 MSE/MAE
 # =========================================================
 @torch.no_grad()
-def _eval_on_subset(args, logger, ckpt_path, base_dataset, subset, tag: str):
+def _eval_on_subset_24to24(args, logger, ckpt_path, subset, tag: str):
     device = args.gpu
-    loader = DataLoader(subset, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers, pin_memory=True)
+    loader = DataLoader(
+        subset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
 
     model, _, _, _ = _build_model_and_optim(args, device)
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
 
-    mse_list, mae_list, idx_list = [], [], []
-    pred_last_list, true_last_list = [], []
-    pred_seq_chunks, true_seq_chunks = [], []
+    mse_list, mae_list = [], []
 
-    for batch_x, batch_y, batch_idx in loader:
-        _, _, L, C = batch_x.shape  # C=6
-        x = batch_x.to(device).reshape(-1, L, C)
-        y = batch_y.to(device).reshape(-1, L, 1)
+    for batch_x, batch_y, _ in loader:
+        # batch_x: [B,1,24,6]  batch_y:[B,1,24,1]
+        _, _, L, C = batch_x.shape
+        x = batch_x.to(device).reshape(-1, L, C)      # [B,24,6]
+        y = batch_y.to(device).reshape(-1, L, 1)      # [B,24,1]
 
-        out_all = model(x)
-        pred = out_all[:, -1, :].unsqueeze(-1)
+        out_all = model(x)                            # 预期输出含时间维 L
+        pred = out_all[:, -1, :].unsqueeze(-1)        # [B,24,1] 兼容你原来的写法
 
-        p = pred.squeeze(-1).detach().cpu().numpy().astype(np.float32)
-        t = y.squeeze(-1).detach().cpu().numpy().astype(np.float32)
+        p = pred.detach().cpu().numpy().astype(np.float32)  # [B,24,1]
+        t = y.detach().cpu().numpy().astype(np.float32)     # [B,24,1]
 
-        idx_list.append(batch_idx.view(-1).cpu().numpy())
-        mse_list.extend(((p - t) ** 2).mean(axis=1).tolist())
-        mae_list.extend(np.abs(p - t).mean(axis=1).tolist())
+        mse_list.extend(((p - t) ** 2).mean(axis=(1, 2)).tolist())
+        mae_list.extend(np.abs(p - t).mean(axis=(1, 2)).tolist())
 
-        pred_last_list.extend(p[:, -1].tolist())
-        true_last_list.extend(t[:, -1].tolist())
-
-        pred_seq_chunks.append(p)
-        true_seq_chunks.append(t)
-
-    if len(idx_list) == 0:
+    if len(mse_list) == 0:
         logger.warning("%s has no samples, skip.", tag)
-        return
+        return None
 
-    widx = np.concatenate(idx_list, axis=0).astype(np.int64)
-    pred_seq = np.concatenate(pred_seq_chunks, axis=0)
-    true_seq = np.concatenate(true_seq_chunks, axis=0)
+    avg_mse = float(np.mean(mse_list))
+    avg_mae = float(np.mean(mae_list))
+    logger.info("[%s] Avg MSE=%.6f | Avg MAE=%.6f | n=%d", tag, avg_mse, avg_mae, len(mse_list))
+    return {"tag": tag, "mse": avg_mse, "mae": avg_mae, "n": int(len(mse_list))}
 
-    window_times = getattr(base_dataset, "window_start_times", None)
-    window_tails = getattr(base_dataset, "window_tails", None)
 
-    metrics_df = pd.DataFrame({
-        "window_idx": widx,
-        "mse": np.array(mse_list, dtype=float),
-        "mae": np.array(mae_list, dtype=float),
-        "pred_last": np.array(pred_last_list, dtype=float),
-        "true_last": np.array(true_last_list, dtype=float),
-        "start_time": [window_times[i] for i in widx] if window_times is not None else None,
-        "tail": [window_tails[i] for i in widx] if window_tails is not None else None,
-    })
-    metrics_df["start_time"] = pd.to_datetime(metrics_df["start_time"], errors="coerce")
-
-    fault_map = load_fault_map_for_side(args.side)
-    if fault_map:
-        metrics_df["fault_date"] = metrics_df["tail"].map(fault_map)
-        metrics_df["fault_date"] = pd.to_datetime(metrics_df["fault_date"], errors="coerce")
-        metrics_df["days_to_fault"] = (
-            metrics_df["fault_date"] - metrics_df["start_time"]
-        ).dt.total_seconds() / 86400.0
-    else:
-        metrics_df["fault_date"] = pd.NaT
-        metrics_df["days_to_fault"] = np.nan
-
-    save_dir = os.path.join(args.checkpoints, args.setting)
+# =========================================================
+# 3) train：保存 epoch 级记录 + 曲线图
+# =========================================================
+def _save_train_curves(save_dir: str, df: pd.DataFrame, setting: str):
     os.makedirs(save_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(save_dir, "train_curve.csv")
+    df.to_csv(csv_path, index=False)
 
-    metrics_path = os.path.join(save_dir, f"{tag}_metrics_{stamp}.csv")
-    metrics_df.to_csv(metrics_path, index=False)
-    logger.info("%s metrics saved: %s | Avg MSE=%.6f MAE=%.6f",
-                tag, metrics_path, float(np.mean(mse_list)), float(np.mean(mae_list)))
+    # loss curve png
+    plt.figure()
+    plt.plot(df["epoch"].values, df["train_loss"].values, label="train_loss")
+    plt.plot(df["epoch"].values, df["val_loss"].values, label="val_loss")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.title(setting)
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    png_path = os.path.join(save_dir, "loss_curve.png")
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=160)
+    plt.close()
 
-    seq_path = os.path.join(save_dir, f"{tag}_pred_true_seq_{stamp}.npz")
-    np.savez_compressed(
-        seq_path,
-        window_idx=widx.astype(np.int64),
-        pred=pred_seq.astype(np.float32),
-        true=true_seq.astype(np.float32),
-    )
-    logger.info("%s pred/true seq saved: %s | shape=%s", tag, seq_path, tuple(pred_seq.shape))
 
-# =========================================================
-# 5) train / eval
-# =========================================================
-def train_right_regression_timerxl(args):
+def train_timerxl_forecast24to24(args):
     logger = setup_logger(args.setting)
     device = args.gpu
 
-    base_all, full_ds, train_ds, val_ds, train_loader, val_loader = _build_loaders(args)
-
-    logger.info("Total train_normal windows = %d", len(full_ds))
-    logger.info("Train windows = %d", len(train_ds))
-    logger.info("Val windows   = %d", len(val_ds))
-    logger.info("Feature names = %s", getattr(base_all, "feature_names", None))
+    base_all, full_ds, train_ds, val_ds, train_loader, val_loader = _build_loaders(args, logger)
 
     model, optim, sched, criterion = _build_model_and_optim(args, device)
 
@@ -324,7 +208,10 @@ def train_right_regression_timerxl(args):
     os.makedirs(save_dir, exist_ok=True)
 
     best_val = float("inf")
-    best_path = os.path.join(save_dir, "best_timerxl_right_reg.pth")
+    best_path = os.path.join(save_dir, "best_timerxl_24to24.pth")
+    final_path = os.path.join(save_dir, "final_timerxl_24to24.pth")
+
+    curve_rows = []
 
     for ep in range(1, args.train_epochs + 1):
         model.train()
@@ -332,12 +219,12 @@ def train_right_regression_timerxl(args):
         tr_sum, nsamp = 0.0, 0
 
         for batch_x, batch_y, _ in train_loader:
-            _, _, L, C = batch_x.shape
-            x = batch_x.to(device).reshape(-1, L, C)
-            y = batch_y.to(device).reshape(-1, L, 1)
+            _, _, L, C = batch_x.shape  # L=24 C=6
+            x = batch_x.to(device).reshape(-1, L, C)  # [B,24,6]
+            y = batch_y.to(device).reshape(-1, L, 1)  # [B,24,1]
 
-            pred_all = model(x)
-            pred = pred_all[:, -1, :].unsqueeze(-1)
+            out_all = model(x)
+            pred = out_all[:, -1, :].unsqueeze(-1)     # [B,24,1]
             loss = criterion(pred, y)
 
             optim.zero_grad()
@@ -356,53 +243,75 @@ def train_right_regression_timerxl(args):
                 _, _, L, C = batch_x.shape
                 x = batch_x.to(device).reshape(-1, L, C)
                 y = batch_y.to(device).reshape(-1, L, 1)
+
                 out_all = model(x)
                 pred = out_all[:, -1, :].unsqueeze(-1)
                 loss = criterion(pred, y)
+
                 val_sum += loss.item() * x.size(0)
                 vsamp += x.size(0)
 
         val_loss = val_sum / max(1, vsamp)
         dt = time.time() - t0
-        lr_now = optim.param_groups[0]["lr"]
+        lr_now = float(optim.param_groups[0]["lr"])
 
         logger.info(
-            f"Epoch {ep}/{args.train_epochs} | train={train_loss:.6f} | val={val_loss:.6f} | lr={lr_now:.2e} | {dt:.1f}s"
+            "Epoch %d/%d | train=%.6f | val=%.6f | lr=%.2e | %.1fs",
+            ep, args.train_epochs, train_loss, val_loss, lr_now, dt
         )
+
+        curve_rows.append({
+            "epoch": ep,
+            "train_loss": float(train_loss),
+            "val_loss": float(val_loss),
+            "lr": lr_now,
+            "sec": float(dt),
+            "n_train": int(len(train_ds)),
+            "n_val": int(len(val_ds)),
+        })
+
+        # save curve each epoch (方便中途挂了也有记录)
+        curve_df = pd.DataFrame(curve_rows)
+        _save_train_curves(save_dir, curve_df, args.setting)
 
         if val_loss < best_val:
             best_val = val_loss
             torch.save(model.state_dict(), best_path)
-            logger.info(f"New best model saved → {best_path}")
+            logger.info("New best model saved -> %s", best_path)
 
         if sched is not None:
             sched.step()
 
-    final_path = os.path.join(save_dir, "final_timerxl_right_reg.pth")
     torch.save(model.state_dict(), final_path)
-    logger.info(f"Training finished. Best val={best_val:.6f}")
+    logger.info("Training finished. Best val=%.6f | best_path=%s", best_val, best_path)
+    logger.info("Final model saved -> %s", final_path)
 
-def evaluate_regression_timerxl(args, ckpt_path):
+
+# =========================================================
+# 4) evaluate：test_normal_recent / test_abnormal
+# =========================================================
+def evaluate_timerxl_forecast24to24(args, ckpt_path):
     logger = setup_logger(args.setting + "_eval")
 
     logger.info("Evaluating on test_normal_recent ...")
     base_nr = FlightDataset_acm(args, Tag="test_normal_recent", side=args.side)
     if len(base_nr) > 0:
-        ds_nr = Dataset_RegRight_TimerXL(base_nr)
-        _eval_on_subset(args, logger, ckpt_path, base_nr, ds_nr, tag="test_normal_recent")
+        ds_nr = Dataset_Forecast24to24_From96(base_nr, in_len=args.in_len, out_len=args.out_len, stride=args.stride)
+        _eval_on_subset_24to24(args, logger, ckpt_path, ds_nr, tag="test_normal_recent")
     else:
         logger.warning("No test_normal_recent data found, skip.")
 
     logger.info("Evaluating on test_abnormal ...")
     base_abn = FlightDataset_acm(args, Tag="test_abnormal", side=args.side)
     if len(base_abn) > 0:
-        ds_abn = Dataset_RegRight_TimerXL(base_abn)
-        _eval_on_subset(args, logger, ckpt_path, base_abn, ds_abn, tag="test_abnormal")
+        ds_abn = Dataset_Forecast24to24_From96(base_abn, in_len=args.in_len, out_len=args.out_len, stride=args.stride)
+        _eval_on_subset_24to24(args, logger, ckpt_path, ds_abn, tag="test_abnormal")
     else:
         logger.warning("No abnormal data found, skip.")
 
+
 # =========================================================
-# 6) Main：自动跑 PACK1/PACK2
+# 5) Main：自动跑 PACK1 / PACK2
 # =========================================================
 if __name__ == "__main__":
 
@@ -410,7 +319,15 @@ if __name__ == "__main__":
         pass
 
     base_args = Args()
+
+    # base window（用于缓存）：仍然用 96
     base_args.seq_len = 96
+
+    # 24->24 的训练切片参数（用于确认是否用了 24->24）
+    base_args.in_len = 24
+    base_args.out_len = 24
+    base_args.stride = 24
+
     base_args.gpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # TimerXL
@@ -434,30 +351,36 @@ if __name__ == "__main__":
     base_args.val_ratio = 0.1
     base_args.split_seed = 42
 
-    # Alarm
-    base_args.alarm_threshold = 0.5
+    # 每个航段取多少个 base window（
+    base_args.max_windows_per_flight = 5
 
     # Paths
     base_args.checkpoints = "./checkpoints"
 
     # 时间切分（你的规则）
-    base_args.normal_months = 1
+    base_args.normal_months = 10
     base_args.test_normal_months = 1
     base_args.fault_gap_months = 6
     base_args.normal_anchor_end = "2025-08-01"
 
-    # 方案A：raw 两年缓存参数
-    base_args.raw_months = 24
+    # raw 两年缓存参数
+    base_args.raw_months = 12
     base_args.raw_end_use_gap = False  # True: raw_end = fd-gap_months；False: raw_end=fd
 
+    # raw verbose（想看更细 print 就打开）
+    base_args.verbose_raw =  True  
+    base_args.verbose_every_n_param = 1
+    base_args.verbose_flush = True
+
     # debug 航段可视化（可选）
-    base_args.debug_plot_tail = ""          # 例如 "B-301A"
+    base_args.debug_plot_tail = ""
     base_args.debug_plot_mode = "train_normal"
     base_args.debug_plot_n_segments = 3
     base_args.debug_plot_steps = 96 * 5
 
     base_setting = (
-        f"timerxl_reg_raw{base_args.raw_months}m_train{base_args.normal_months}m_test{base_args.test_normal_months}m_"
+        f"timerxl_forecast_in{base_args.in_len}_out{base_args.out_len}_stride{base_args.stride}_"
+        f"raw{base_args.raw_months}m_train{base_args.normal_months}m_test{base_args.test_normal_months}m_"
         f"gap{base_args.fault_gap_months}m_{base_args.normal_anchor_end}end_noALTSTD"
     )
 
@@ -467,21 +390,23 @@ if __name__ == "__main__":
         args.side = side
         args.setting = f"{base_setting}_{side}"
 
-        best_ckpt = os.path.join(args.checkpoints, args.setting, "best_timerxl_right_reg.pth")
+        best_ckpt = os.path.join(args.checkpoints, args.setting, "best_timerxl_24to24.pth")
 
         print("\n==============================")
         print(
             f"Running side={side} | setting={args.setting} | "
+            f"base_seq_len={args.seq_len} | in={args.in_len} out={args.out_len} stride={args.stride} | "
             f"rawM={args.raw_months} trainM={args.normal_months} testM={args.test_normal_months} gapM={args.fault_gap_months} "
-            f"anchor_end(no-fault)={args.normal_anchor_end} raw_end_use_gap={args.raw_end_use_gap}"
+            f"anchor_end(no-fault)={args.normal_anchor_end} raw_end_use_gap={args.raw_end_use_gap} | "
+            f"max_windows_per_flight={args.max_windows_per_flight}"
         )
         print("==============================")
 
         if os.path.exists(best_ckpt):
-            print("Found existing checkpoint → evaluating")
-            evaluate_regression_timerxl(args, ckpt_path=best_ckpt)
+            print("Found existing checkpoint -> evaluating")
+            evaluate_timerxl_forecast24to24(args, ckpt_path=best_ckpt)
         else:
-            print("No checkpoint found → training")
-            train_right_regression_timerxl(args)
+            print("No checkpoint found -> training")
+            train_timerxl_forecast24to24(args)
             if os.path.exists(best_ckpt):
-                evaluate_regression_timerxl(args, ckpt_path=best_ckpt)
+                evaluate_timerxl_forecast24to24(args, ckpt_path=best_ckpt)
