@@ -11,13 +11,12 @@ from iotdb.table_session import TableSession, TableSessionConfig
 from tqdm import tqdm
 import torch
 
-# 可视化（可选）
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # =========================================================
-# 0. 统一基于本文件位置的路径（避免 cwd 不同导致找不到 CSV）
+# 0. 统一基于本文件位置的路径
 # =========================================================
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))  # .../project_root/data_provider
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)              # .../project_root
@@ -64,19 +63,12 @@ try:
         _fault_df["side"] = pd.NA
         _fault_df["pack"] = pd.NA
 
-    fault_dates_by_tail = (
-        _fault_df.groupby("机号")["首发日期"]
-        .apply(lambda s: sorted(pd.to_datetime(s, errors="coerce").dropna().unique()))
-        .to_dict()
-    )
-
     fault_dates_by_tail_pack1 = (
         _fault_df[_fault_df["pack"] == 1]
         .groupby("机号")["首发日期"]
         .apply(lambda s: sorted(pd.to_datetime(s, errors="coerce").dropna().unique()))
         .to_dict()
     )
-
     fault_dates_by_tail_pack2 = (
         _fault_df[_fault_df["pack"] == 2]
         .groupby("机号")["首发日期"]
@@ -86,13 +78,11 @@ try:
 
 except FileNotFoundError:
     print(f"[WARN] 未找到 faults CSV: {FAULT_CSV_PATH}，视为无故障机号。")
-    fault_dates_by_tail = {}
     fault_dates_by_tail_pack1 = {}
     fault_dates_by_tail_pack2 = {}
 
 
 def _get_fault_dates_for_tail_side(tail_num: str, side_key: str):
-    """给定机号和 side_key ('PACK1' / 'PACK2')，取该侧的故障日期列表"""
     if side_key == "PACK1":
         return fault_dates_by_tail_pack1.get(tail_num, [])
     elif side_key == "PACK2":
@@ -126,7 +116,6 @@ PARAMS_BY_SIDE = {"PACK1": PACK1_PARA, "PACK2": PACK2_PARA}
 # 4. 插值工具
 # =========================================================
 def interpolate_to_grid(df_src: pd.DataFrame, grid_time_ns: np.ndarray, col_name: str):
-    """把 df_src[col_name] 沿 df_src['time'] 线性插值到 grid_time_ns（int64 ns）"""
     if len(df_src) == 0:
         return np.full(len(grid_time_ns), np.nan, dtype=float)
 
@@ -152,19 +141,6 @@ def get_time_range_for_tail(
     gap_months: int,
     anchor_end_str: str = "2024-01-01",
 ):
-    """
-    对有故障的飞机（按 side 首次故障 fd）：
-      abnormal:      [fd-1M, fd)
-      anchor_end     = fd-gap_months
-      test_normal:   [anchor_end-test_months, anchor_end)
-      train_normal:  [anchor_end-(test_months+train_months), anchor_end-test_months)
-
-    对无故障飞机：
-      anchor_end = anchor_end_str
-      test_normal:   [anchor_end-test_months, anchor_end)
-      train_normal:  [anchor_end-(test_months+train_months), anchor_end-test_months)
-      abnormal: None
-    """
     train_months = int(max(1, train_months))
     test_months = int(max(1, test_months))
     gap_months = int(max(0, gap_months))
@@ -209,11 +185,7 @@ def _vprint(args, *msg):
     print(*msg, flush=flush)
 
 
-# =========================================================
-# 6.1 Dataset debug print（更粗粒度）
-# =========================================================
 def _dprint(args, *msg):
-    """数据集构建阶段的 debug 打印（不依赖 verbose_raw）"""
     if not bool(getattr(args, "verbose_ds", True)):
         return
     flush = bool(getattr(args, "verbose_flush", True))
@@ -228,9 +200,7 @@ def _fmt_dt_ns(ns: int):
 
 
 # =========================================================
-# 7. 方案A：raw npz 固定按 tail+side+统一 raw_months 范围缓存
-#    - 关键：npz 永远不存 object dtype（allow_pickle=False 可读）
-#    - 旧缓存（object）自动删除并重建
+# 7. raw npz 缓存（tail+side+raw_range）
 # =========================================================
 def _feat_hash(feat_cols):
     s = ",".join([str(c) for c in feat_cols]).encode("utf-8")
@@ -251,12 +221,6 @@ def get_raw_2y_range_for_tail(
     anchor_end_str: str,
     raw_end_use_gap: bool = False,
 ):
-    """
-    raw 两年范围（或 raw_months）：
-      - 有故障：raw_end = fd（默认） 或 fd-gap_months（raw_end_use_gap=True）
-      - 无故障：raw_end = anchor_end_str
-      raw_start = raw_end - raw_months
-    """
     raw_months = int(max(1, raw_months))
     fdates = _get_fault_dates_for_tail_side(tail_num, side)
     if fdates:
@@ -278,13 +242,6 @@ def load_or_build_raw_npz_2y(
     raw_end: pd.Timestamp,
     gap_threshold_sec: float,
 ):
-    """
-    只按 tail+side+raw_start/raw_end 缓存 raw（不含 mode）
-    返回:
-      time_ns: int64 [T]
-      X: float32 [T,D]
-      feat_saved: list[str]
-    """
     cache_root = _raw_cache_dir()
     fhash = _feat_hash(feat_cols)
 
@@ -299,7 +256,6 @@ def load_or_build_raw_npz_2y(
         f"{side}_{tail_num}_raw{raw_start.strftime('%Y%m%d')}_{raw_end.strftime('%Y%m%d')}_gap{int(gap_threshold_sec)}_{fhash}.npz"
     )
 
-    # ---------- 读缓存（永远 allow_pickle=False，强校验，不合格自动删重建） ----------
     if os.path.exists(npz_path):
         t0 = time.time()
         try:
@@ -334,7 +290,6 @@ def load_or_build_raw_npz_2y(
 
     master_param = "PACK1_DISCH_T" if side == "PACK1" else "PACK2_DISCH_T"
 
-    # ---------- 1) 主变量拉 time 轴 ----------
     master_query = f"""
         SELECT time, value
         FROM {master_param}
@@ -361,14 +316,13 @@ def load_or_build_raw_npz_2y(
     master_df.columns = ["time", master_param]
     master_df["time"] = pd.to_datetime(master_df["time"], utc=True).dt.tz_convert("Asia/Shanghai")
     times = master_df["time"].values
-    time_ns = times.view("i8").astype(np.int64)  # [T]
+    time_ns = times.view("i8").astype(np.int64)
 
     raw_cols = {}
     raw_cols[master_param] = master_df[master_param].astype(float).to_numpy()
 
     every_n = int(max(1, getattr(args, "verbose_every_n_param", 1)))
 
-    # ---------- 2) 拉其它参数 + 插值到 time_ns ----------
     for pi, param in enumerate(feat_cols):
         if param == master_param:
             continue
@@ -413,7 +367,6 @@ def load_or_build_raw_npz_2y(
         axis=1
     ).astype(np.float32)
 
-    # ---------- 3) 保存缓存：feature_names 永远 str dtype ----------
     np.savez(
         npz_path,
         time_ns=time_ns.astype(np.int64),
@@ -436,7 +389,6 @@ def slice_raw_by_time_range(
     side="",
     mode="",
 ):
-    """用 searchsorted 在已排序 time_ns 上裁剪到 [start_ts_ns, end_ts_ns)，带更细日志"""
     if len(time_ns) == 0:
         if args is not None:
             _dprint(args, f"[SLICE][{tail}][{side}][{mode}] raw empty -> slice empty")
@@ -470,7 +422,6 @@ def slice_raw_by_time_range(
 
 
 def recompute_segments_from_time(time_ns: np.ndarray, gap_threshold_sec: float):
-    """在裁剪后的 time_ns 上重新按 gap_threshold_sec 切航段"""
     if len(time_ns) == 0:
         return np.zeros((0, 2), dtype=np.int32)
     t_s = (time_ns.astype(np.float64) / 1e9)
@@ -485,7 +436,7 @@ def recompute_segments_from_time(time_ns: np.ndarray, gap_threshold_sec: float):
 
 
 # =========================================================
-# 8. 航段开始可视化（每段取 96*5=480 点，多变量，一张图）
+# 8. 航段开始可视化（多变量）
 # =========================================================
 def plot_segment_starts(
     time_ns: np.ndarray,
@@ -548,7 +499,6 @@ def print_first_steps(
     side: str = "",
     mode: str = "",
 ):
-    """只打印前 n_steps 的表（不会生成窗口）"""
     if len(time_ns) == 0 or X.shape[0] == 0:
         print(f"[Preview] empty series for {tail} {side} {mode}")
         return
@@ -562,16 +512,9 @@ def print_first_steps(
 
 # =========================================================
 # 9. A320 PACK 数据集：FlightDataset_acm（支持 PACK1 / PACK2）
+#    只保留每个航段前 keep_len = max_windows_per_flight * seq_len 点
 # =========================================================
 class FlightDataset_acm(Dataset):
-    """
-    A320 ACM 数据集（PACK1 / PACK2 通用）
-
-    - raw npz：按 tail+side+raw_months 统一范围缓存一次
-    - train/test/abnormal：只从 raw 裁剪 + 本地重切航段 + 切窗口
-    - 完全删除 ALT_STD
-    """
-
     def __init__(self, args, Tag, side="PACK1"):
         super().__init__()
         self.args = args
@@ -626,27 +569,33 @@ class FlightDataset_acm(Dataset):
         self.fault_gap_months = int(getattr(self.args, "fault_gap_months", 6))
         self.normal_anchor_end = str(getattr(self.args, "normal_anchor_end", "2024-01-01"))
 
-        # raw 缓存范围（默认两年）
+        # raw 缓存范围
         self.raw_months = int(getattr(self.args, "raw_months", 24))
         self.raw_end_use_gap = bool(getattr(self.args, "raw_end_use_gap", False))
 
-        # ====== 窗口级 cache（仍保留，避免每次重切）======
+        # keep_len（每航段只保存前 max_windows_per_flight*seq_len 点）
+        base_seq_len = int(getattr(self.args, "seq_len", 96))  # 仍然是 96
+        self.max_windows_per_flight = int(getattr(self.args, "max_windows_per_flight", 5))
+        self.keep_len = base_seq_len * self.max_windows_per_flight  # 例如 480
+
         cache_dir = os.path.join(_PROJECT_ROOT, "cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        cache_version = "vA2_raw2y_noALTSTD_no_object"
+        cache_version = "vA3_seghead_keepKx96_noALTSTD_no_object"
         anchor_safe = self.normal_anchor_end.replace("-", "")
         self.dataset_name = (
-            f"A320_seq{int(self.args.seq_len)}_raw{self.raw_months}M_"
+            f"A320_keep{self.max_windows_per_flight}x{base_seq_len}_L{self.keep_len}_"
+            f"raw{self.raw_months}M_"
             f"train{self.train_months}M_test{self.test_normal_months}M_gap{self.fault_gap_months}M_"
             f"anchor{anchor_safe}_{cache_version}_{self.side}_{len(self.all_planes)}planes_"
             + "_".join(self.para)
         )
 
-        data_path = os.path.join(cache_dir, f"{self.dataset_name}_{Tag}_data.npy")
+        # seghead cache（避免撞旧 cache）
+        data_path = os.path.join(cache_dir, f"{self.dataset_name}_{Tag}_seghead_data.npy")
         feat_path = os.path.join(cache_dir, f"{self.dataset_name}_{Tag}_feature_names.npy")
-        meta_time_path = os.path.join(cache_dir, f"{self.dataset_name}_{Tag}_window_start_times.npy")
-        meta_tail_path = os.path.join(cache_dir, f"{self.dataset_name}_{Tag}_window_tails.npy")
+        meta_time_path = os.path.join(cache_dir, f"{self.dataset_name}_{Tag}_seghead_start_times.npy")
+        meta_tail_path = os.path.join(cache_dir, f"{self.dataset_name}_{Tag}_seghead_tails.npy")
 
         scaler_tag = "train_normal"
         scaler_mean_path = os.path.join(cache_dir, f"{self.dataset_name}_{scaler_tag}_mean.npy")
@@ -660,17 +609,16 @@ class FlightDataset_acm(Dataset):
             t_load0 = time.time()
             self.data = np.load(data_path, allow_pickle=False)
 
-            # 注意：这里也建议别用 object 保存，但先兼容现状
             if os.path.exists(feat_path):
-                self.feature_names = list(np.load(feat_path, allow_pickle=True))
+                self.feature_names = [str(x) for x in np.load(feat_path, allow_pickle=False).tolist()]
             else:
                 self.feature_names = list(self.para)
 
-            self.window_start_times = list(np.load(meta_time_path, allow_pickle=True))
-            self.window_tails = list(np.load(meta_tail_path, allow_pickle=True))
+            self.window_start_times = [str(x) for x in np.load(meta_time_path, allow_pickle=False).tolist()]
+            self.window_tails = [str(x) for x in np.load(meta_tail_path, allow_pickle=False).tolist()]
             t_load1 = time.time()
             print(
-                f"[Cache] 使用窗口级 cache: {data_path} (Tag={Tag}, side={self.side}) | "
+                f"[Cache] 使用 seghead cache: {data_path} (Tag={Tag}, side={self.side}) | "
                 f"{t_load1 - t_load0:.3f}s | data.shape={self.data.shape} | meta_len={len(self.window_start_times)}"
             )
             return
@@ -744,32 +692,31 @@ class FlightDataset_acm(Dataset):
     def _flight_data(self, tail_list, para_list, mode):
         """
         流程：
-          1) 先算每架 tail 的 raw 统一范围（默认24个月）
-          2) raw npz：若无则拉 IoTDB 一次并缓存
-          3) 根据 mode 的 start/end 从 raw 裁剪
-          4) 在裁剪序列上重切航段（按 gap_threshold_sec）
-          5) 每航段切 seq_len window（每段取前 max_windows_per_flight 个）
+          1) 统一 raw 范围缓存（tail+side+raw_range）
+          2) 按 mode 裁剪
+          3) 裁剪后重切航段（gap_threshold_sec）
+          4) 每航段只保留起始 keep_len = max_windows_per_flight*seq_len 点（1条/航段）
         """
         all_seqs = []
-        window_start_times = []
-        window_tails = []
+        seg_start_times = []
+        seg_tails = []
         feature_names_once = None
 
         max_windows_per_flight = int(getattr(self.args, "max_windows_per_flight", 5))
         gap_threshold_sec = float(getattr(self.args, "flight_gap_threshold_sec", 3600.0))
-        seq_len = int(self.args.seq_len)
+        seq_len = int(getattr(self.args, "seq_len", 96))  # base window=96
+        keep_len = int(seq_len * max_windows_per_flight)  # 例如 480
 
         debug_plot_tail = str(getattr(self.args, "debug_plot_tail", ""))
         debug_plot_mode = str(getattr(self.args, "debug_plot_mode", mode))
         debug_plot_nseg = int(getattr(self.args, "debug_plot_n_segments", 3))
-        debug_plot_steps = int(getattr(self.args, "debug_plot_steps", 96 * 5))
+        debug_plot_steps = int(getattr(self.args, "debug_plot_steps", keep_len))
 
         for tail_num in tqdm(tail_list, desc=f"[A320-{mode}-{self.side}] Fetching..."):
             print(f"\n--- [{tail_num}] 开始处理 (mode={mode}, side={self.side}) ---")
             _dprint(self.args, f"[DS][{tail_num}][{self.side}][{mode}] train_months={self.train_months} test_months={self.test_normal_months} gap_months={self.fault_gap_months} anchor_end={self.normal_anchor_end}")
-            _dprint(self.args, f"[DS][{tail_num}][{self.side}][{mode}] raw_months={self.raw_months} raw_end_use_gap={self.raw_end_use_gap} gap_threshold_sec={gap_threshold_sec} seq_len={seq_len} max_windows_per_flight={max_windows_per_flight}")
+            _dprint(self.args, f"[DS][{tail_num}][{self.side}][{mode}] raw_months={self.raw_months} raw_end_use_gap={self.raw_end_use_gap} gap_threshold_sec={gap_threshold_sec} seq_len={seq_len} keep_len={keep_len}")
 
-            # 当前 mode 的切片范围
             start_date, end_date = get_time_range_for_tail(
                 tail_num=tail_num,
                 mode=mode,
@@ -785,9 +732,8 @@ class FlightDataset_acm(Dataset):
 
             start_ts_ns_mode = pd.Timestamp(start_date, tz="Asia/Shanghai").value
             end_ts_ns_mode = pd.Timestamp(end_date, tz="Asia/Shanghai").value
-            print(f"  mode范围: {start_date} ~ {end_date} | seq_len={seq_len}")
+            print(f"  mode范围: {start_date} ~ {end_date} | keep_len={keep_len}")
 
-            # 统一 raw 范围（方案A）
             raw_start, raw_end = get_raw_2y_range_for_tail(
                 tail_num=tail_num,
                 side=self.side,
@@ -798,7 +744,6 @@ class FlightDataset_acm(Dataset):
             )
             print(f"  raw范围:  {raw_start} ~ {raw_end} (raw_months={self.raw_months}, raw_end_use_gap={self.raw_end_use_gap})")
 
-            # raw npz（只按 tail+side+raw范围）
             t_raw0 = time.time()
             time_ns_raw, X_raw, feat_cols = load_or_build_raw_npz_2y(
                 session=self.session,
@@ -820,7 +765,6 @@ class FlightDataset_acm(Dataset):
                 print(f"  !!! raw为空, 跳过 {tail_num}")
                 continue
 
-            # mode 时间裁剪（带更细日志）
             time_ns, X = slice_raw_by_time_range(
                 time_ns_raw, X_raw,
                 start_ts_ns_mode, end_ts_ns_mode,
@@ -828,15 +772,10 @@ class FlightDataset_acm(Dataset):
             )
             print(f"[Perf][{tail_num}] mode slice: T={len(time_ns)}")
 
-            if len(time_ns) == 0:
-                _dprint(self.args, f"[WHYEMPTY][{tail_num}][{self.side}][{mode}] mode range has 0 points. "
-                                   f"Usually raw range does NOT cover this mode range OR master_param has no data in this month.")
-
-            if len(time_ns) < seq_len:
-                print(f"  !!! 裁剪后长度<{seq_len}, 跳过")
+            if len(time_ns) < keep_len:
+                print(f"  !!! 裁剪后长度<{keep_len}, 跳过")
                 continue
 
-            # 裁剪后重切航段 + 打印段分布
             segments = recompute_segments_from_time(time_ns, gap_threshold_sec=gap_threshold_sec)
             seg_lens = [int(e) - int(s) for (s, e) in segments.tolist()]
             if len(seg_lens) > 0:
@@ -845,8 +784,9 @@ class FlightDataset_acm(Dataset):
                     s = int(s); e = int(e)
                     _dprint(self.args, f"[SEG][{tail_num}] seg#{ii} idx=[{s},{e}) len={e-s} t0={_fmt_dt_ns(time_ns[s])} t1={_fmt_dt_ns(time_ns[e-1])}")
 
-            valid_segments = [(int(s), int(e)) for (s, e) in segments.tolist() if (int(e) - int(s)) >= seq_len]
-            print(f"[Perf][{tail_num}] segments={len(valid_segments)} after filter")
+            # 关键：只保留能提供 keep_len 的航段
+            valid_segments = [(int(s), int(e)) for (s, e) in segments.tolist() if (int(e) - int(s)) >= keep_len]
+            print(f"[Perf][{tail_num}] segments={len(valid_segments)} after filter(>={keep_len})")
             if len(valid_segments) == 0:
                 continue
 
@@ -854,7 +794,6 @@ class FlightDataset_acm(Dataset):
                 feature_names_once = list(feat_cols)
                 self.feature_names = feature_names_once
 
-            # debug plot（对指定 tail + mode）
             if debug_plot_tail and str(tail_num) == debug_plot_tail and str(mode) == debug_plot_mode:
                 out_png = os.path.join(_PROJECT_ROOT, "cache", "debug_plots",
                                        f"segstart_{tail_num}_{self.side}_{mode}_steps{debug_plot_steps}.png")
@@ -872,42 +811,27 @@ class FlightDataset_acm(Dataset):
                 )
                 print(f"[DebugPlot] saved: {out_png}")
 
-            # 切窗口：每航段取前 max_windows_per_flight 个
-            total_windows_this_tail = 0
+            total_kept_this_tail = 0
             for (s, e) in valid_segments:
-                seg_len = e - s
-                max_k = min(max_windows_per_flight, seg_len // seq_len)
-                _dprint(self.args, f"[WIN][{tail_num}][{self.side}][{mode}] seg idx=[{s},{e}) len={seg_len} -> can_cut={seg_len//seq_len} use={max_k}")
+                head = X[s:s + keep_len, :]  # [keep_len, D] 例如 [480,6]
+                all_seqs.append(head.astype(np.float32))
 
-                for k in range(max_k):
-                    st = s + k * seq_len
-                    ed = st + seq_len
-                    if ed > e:
-                        break
+                t0 = pd.to_datetime(time_ns[s], unit="ns", utc=True).tz_convert("Asia/Shanghai")
+                seg_start_times.append(t0)
+                seg_tails.append(tail_num)
+                total_kept_this_tail += 1
 
-                    if k == 0:
-                        t_st = _fmt_dt_ns(time_ns[st])
-                        t_ed = _fmt_dt_ns(time_ns[ed - 1])
-                        _dprint(self.args, f"[WIN][{tail_num}] first_window_time {t_st} --> {t_ed}")
+            print(f"[Perf][{tail_num}] segheads_kept={total_kept_this_tail}")
 
-                    window = X[st:ed, :]  # [L,D]
-                    all_seqs.append(window.astype(np.float32))
-
-                    t0 = pd.to_datetime(time_ns[st], unit="ns", utc=True).tz_convert("Asia/Shanghai")
-                    window_start_times.append(t0)
-                    window_tails.append(tail_num)
-                    total_windows_this_tail += 1
-
-            print(f"[Perf][{tail_num}] windows={total_windows_this_tail}")
-
-        self.window_start_times = window_start_times
-        self.window_tails = window_tails
-        print(f"[Perf] 总窗口数 (mode={mode}, side={self.side}) = {len(all_seqs)}")
+        # 兼容你原字段名（用于保存 meta）
+        self.window_start_times = seg_start_times
+        self.window_tails = seg_tails
+        print(f"[Perf] 总seghead数 (mode={mode}, side={self.side}) = {len(all_seqs)}")
 
         if len(all_seqs) == 0:
             if not hasattr(self, "feature_names"):
                 self.feature_names = list(self.para)
-            return np.zeros((0, int(self.args.seq_len), len(self.feature_names)), dtype=np.float32)
+            return np.zeros((0, keep_len, len(self.feature_names)), dtype=np.float32)
 
         return np.stack(all_seqs, axis=0)
 
@@ -919,23 +843,26 @@ class FlightDataset_acm(Dataset):
 
 
 # =========================================================
-# 10. TimerXL 回归包装：Dataset_RegRight_TimerXL（6 通道输入）
+# 10) 24->24 Wrapper：从 seghead keep_len 切 24->24
 # =========================================================
-class Dataset_RegRight_TimerXL(Dataset):
+class Dataset_Forecast24to24_FromSegHead(Dataset):
     """
-    输入 x: [1, L, 6]
-    目标 y: PACKx_COMPR_T
-
-    说明：按你要求“直接6通道，删ALT_STD”，这里 x 包含 PACKx_COMPR_T 本身作为一个输入通道（历史）。
+    base_dataset: FlightDataset_acm
+      - 每条样本是 [keep_len, 6]（例如 keep_len=480）
+    输出:
+      x: [1, 24, 6]
+      y: [1, 24, 1]  (未来24点的 PACKx_COMPR_T)
     """
-
-    def __init__(self, base_dataset: FlightDataset_acm):
+    def __init__(self, base_dataset: FlightDataset_acm, in_len=24, out_len=24, stride=24):
         super().__init__()
         self.base = base_dataset
+        self.in_len = int(in_len)
+        self.out_len = int(out_len)
+        self.stride = int(stride)
+
         names = getattr(self.base, "feature_names", [])
         if not names:
-            raise ValueError("base_dataset.feature_names 为空，请确认已正确构建 FlightDataset_acm。")
-
+            raise ValueError("base_dataset.feature_names 为空。")
         n2i = {n: i for i, n in enumerate(names)}
 
         if self.base.side == "PACK1":
@@ -951,26 +878,45 @@ class Dataset_RegRight_TimerXL(Dataset):
             ]
             target_name = "PACK2_DISCH_T"
 
-        need = self.input_names + [target_name]
-        miss = [c for c in need if c not in n2i]
+        miss = [c for c in (self.input_names + [target_name]) if c not in n2i]
         if miss:
-            raise ValueError(f"A320 所需列缺失: {miss}\n当前列: {names}")
+            raise ValueError(f"缺列: {miss} | 当前: {names}")
 
         self.idx_x = [n2i[n] for n in self.input_names]
         self.idx_y = n2i[target_name]
 
+        if len(self.base) > 0:
+            self.base_len = int(self.base.data.shape[1])
+        else:
+            self.base_len = self.in_len + self.out_len
+
+        if self.base_len < self.in_len + self.out_len:
+            raise ValueError(f"base_len={self.base_len} < {self.in_len + self.out_len}")
+
+        # 一个 seghead 能切出多少个 24->24
+        self.n_sub = 1 + (self.base_len - (self.in_len + self.out_len)) // self.stride
+
     def __len__(self):
-        return len(self.base)
+        return len(self.base) * self.n_sub
 
     def __getitem__(self, idx):
-        arr = self.base[idx]  # [L, D]
-        x = torch.from_numpy(arr[:, self.idx_x]).float()                 # [L,6]
-        y = torch.from_numpy(arr[:, self.idx_y:self.idx_y + 1]).float()  # [L,1]
-        return x.unsqueeze(0), y.unsqueeze(0), torch.tensor([idx], dtype=torch.long)
+        base_idx = idx // self.n_sub
+        sub_id = idx % self.n_sub
+        st = sub_id * self.stride
+
+        arr = self.base[base_idx]  # [base_len, D]
+        x = arr[st:st + self.in_len, self.idx_x]  # [24,6]
+        y = arr[st + self.in_len:st + self.in_len + self.out_len, self.idx_y]  # [24]
+
+        x = torch.from_numpy(x).float().unsqueeze(0)                # [1,24,6]
+        y = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1)  # [1,24,1]
+
+        packed = torch.tensor([base_idx * 100 + sub_id], dtype=torch.long)
+        return x, y, packed
 
 
 # =========================================================
-# 11) 轻量预览 main：不构建全量 dataset，只拉 raw + 切片 + 可视化
+# 11) 轻量预览 main（可选）
 # =========================================================
 def _make_session():
     t0 = time.time()
@@ -996,78 +942,12 @@ def _make_session():
     return session
 
 
-class Dataset_Forecast24to24_From96(Dataset):
-    """
-    base_dataset: FlightDataset_acm，里面每个样本是 [96, 6]
-    输出:
-      x: [1, 24, 6]
-      y: [1, 24, 1]  (未来24点的 PACKx_COMPR_T)
-    """
-
-    def __init__(self, base_dataset: FlightDataset_acm, in_len=24, out_len=24, stride=24):
-        super().__init__()
-        self.base = base_dataset
-        self.in_len = int(in_len)
-        self.out_len = int(out_len)
-        self.stride = int(stride)
-
-        names = getattr(self.base, "feature_names", [])
-        if not names:
-            raise ValueError("base_dataset.feature_names 为空。")
-
-        n2i = {n: i for i, n in enumerate(names)}
-
-        if self.base.side == "PACK1":
-            self.input_names = [
-                "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
-                "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
-            ]
-            target_name = "PACK1_COMPR_T"
-        else:
-            self.input_names = [
-                "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
-                "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
-            ]
-            target_name = "PACK2_COMPR_T"
-
-        miss = [c for c in (self.input_names + [target_name]) if c not in n2i]
-        if miss:
-            raise ValueError(f"缺列: {miss} | 当前: {names}")
-
-        self.idx_x = [n2i[n] for n in self.input_names]  # 6通道
-        self.idx_y = n2i[target_name]
-
-        # base_len = 96
-        self.base_len = int(getattr(self.base.args, "seq_len", 96))
-        if self.base_len < self.in_len + self.out_len:
-            raise ValueError(f"base seq_len={self.base_len} < {self.in_len+self.out_len}")
-
-        # 一个 96-window 能切出多少个 24->24
-        self.n_sub = 1 + (self.base_len - (self.in_len + self.out_len)) // self.stride
-
-    def __len__(self):
-        return len(self.base) * self.n_sub
-
-    def __getitem__(self, idx):
-        base_idx = idx // self.n_sub
-        sub_id = idx % self.n_sub
-        st = sub_id * self.stride
-
-        arr = self.base[base_idx]  # [96, 6]
-        x = arr[st:st + self.in_len, self.idx_x]  # [24,6]
-        y = arr[st + self.in_len:st + self.in_len + self.out_len, self.idx_y]  # [24]
-
-        x = torch.from_numpy(x).float().unsqueeze(0)                # [1,24,6]
-        y = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1)  # [1,24,1]
-        packed = torch.tensor([base_idx * 100 + sub_id], dtype=torch.long)
-        return x, y, packed
-
-
 def preview_tails_without_building_dataset(
     tails,
     side="PACK2",
     mode="train_normal",
     seq_len=96,
+    max_windows_per_flight=5,
     n_steps=96 * 5,
     raw_months=24,
     fault_gap_months=6,
@@ -1078,14 +958,6 @@ def preview_tails_without_building_dataset(
     out_dir=None,
     verbose=True,
 ):
-    """
-    不切窗口、不构建全量 dataset：
-      1) 拉 raw（缓存）
-      2) 按 mode 切片
-      3) 重切航段
-      4) 可选：打印前 n_steps 行
-      5) 可视化前几段航段起始
-    """
     class Args:
         pass
 
@@ -1100,6 +972,8 @@ def preview_tails_without_building_dataset(
     para_list = PARAMS_BY_SIDE[side]
     out_dir = out_dir or os.path.join(_PROJECT_ROOT, "cache", "preview_plots")
     os.makedirs(out_dir, exist_ok=True)
+
+    keep_len = int(seq_len * max_windows_per_flight)
 
     for tail in tails:
         print("\n==============================")
@@ -1165,8 +1039,8 @@ def preview_tails_without_building_dataset(
         )
 
         segments = recompute_segments_from_time(time_ns, gap_threshold_sec=float(gap_threshold_sec))
-        valid = [(int(s), int(e)) for (s, e) in segments.tolist() if (int(e) - int(s)) >= int(seq_len)]
-        print(f"[Preview] segments total={len(segments)} valid(>={seq_len})={len(valid)}")
+        valid = [(int(s), int(e)) for (s, e) in segments.tolist() if (int(e) - int(s)) >= int(keep_len)]
+        print(f"[Preview] segments total={len(segments)} valid(>={keep_len})={len(valid)}")
         if len(valid) == 0:
             continue
 
@@ -1190,8 +1064,9 @@ if __name__ == "__main__":
     preview_tails_without_building_dataset(
         tails=["B-301A", "B-301G"],
         side="PACK2",
-        mode="train_normal",      # "train_normal" / "test_normal" / "abnormal"
+        mode="train_normal",
         seq_len=96,
+        max_windows_per_flight=5,
         n_steps=96 * 5,
         raw_months=24,
         fault_gap_months=6,

@@ -23,21 +23,3 @@
 # **/*.pyc
 # **/*.pyo
 # **/*.pyd
-
-
-
-# ===== local cache / model / data artifacts =====
-cache/
-checkpoints/
-logs/
-
-# any cache under modules
-data_provider/cache/
-**/__pycache__/
-
-# numpy/torch artifacts
-*.npy
-*.npz
-*.pth
-*.pt
-EOF
