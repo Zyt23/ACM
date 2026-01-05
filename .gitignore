@@ -1,0 +1,25 @@
+# Ignore everything by default
+*
+
+# But keep git-related files
+!.gitignore
+!.gitattributes
+!.gitmodules
+!README.md
+!LICENSE
+
+# Allow these directories (and all their contents)
+!data_provider/
+!data_provider/**
+
+!exp/
+!exp/**
+
+!alarm/
+!alarm/**
+
+# (Optional but common) If you still want to ignore Python caches even inside allowed dirs, uncomment:
+# **/__pycache__/
+# **/*.pyc
+# **/*.pyo
+# **/*.pyd
