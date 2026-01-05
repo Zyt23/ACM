@@ -447,7 +447,7 @@ if __name__ == "__main__":
     base_args.normal_anchor_end = "2025-08-01"
 
     # 方案A：raw 两年缓存参数
-    base_args.raw_months = 2
+    base_args.raw_months = 24
     base_args.raw_end_use_gap = False  # True: raw_end = fd-gap_months；False: raw_end=fd
 
     # debug 航段可视化（可选）
