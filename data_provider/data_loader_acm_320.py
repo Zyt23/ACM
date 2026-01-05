@@ -905,6 +905,74 @@ def _make_session():
     session.execute_non_query_statement("USE a320_ata21")
     return session
 
+
+class Dataset_Forecast24to24_From96(Dataset):
+    """
+    base_dataset: FlightDataset_acm，里面每个样本是 [96, 6]
+    输出:
+      x: [1, 24, 6]
+      y: [1, 24, 1]  (未来24点的 PACKx_COMPR_T)
+    """
+
+    def __init__(self, base_dataset: FlightDataset_acm, in_len=24, out_len=24, stride=24):
+        super().__init__()
+        self.base = base_dataset
+        self.in_len = int(in_len)
+        self.out_len = int(out_len)
+        self.stride = int(stride)
+
+        names = getattr(self.base, "feature_names", [])
+        if not names:
+            raise ValueError("base_dataset.feature_names 为空。")
+
+        n2i = {n: i for i, n in enumerate(names)}
+
+        if self.base.side == "PACK1":
+            self.input_names = [
+                "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
+                "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
+            ]
+            target_name = "PACK1_COMPR_T"
+        else:
+            self.input_names = [
+                "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
+                "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
+            ]
+            target_name = "PACK2_COMPR_T"
+
+        miss = [c for c in (self.input_names + [target_name]) if c not in n2i]
+        if miss:
+            raise ValueError(f"缺列: {miss} | 当前: {names}")
+
+        self.idx_x = [n2i[n] for n in self.input_names]  # 6通道
+        self.idx_y = n2i[target_name]
+
+        # base_len = 96
+        self.base_len = int(getattr(self.base.args, "seq_len", 96))
+        if self.base_len < self.in_len + self.out_len:
+            raise ValueError(f"base seq_len={self.base_len} < {self.in_len+self.out_len}")
+
+        # 一个 96-window 能切出多少个 24->24
+        self.n_sub = 1 + (self.base_len - (self.in_len + self.out_len)) // self.stride
+
+    def __len__(self):
+        return len(self.base) * self.n_sub
+
+    def __getitem__(self, idx):
+        base_idx = idx // self.n_sub
+        sub_id = idx % self.n_sub
+        st = sub_id * self.stride
+
+        arr = self.base[base_idx]  # [96, 6]
+        x = arr[st:st+self.in_len, self.idx_x]  # [24,6]
+        y = arr[st+self.in_len:st+self.in_len+self.out_len, self.idx_y]  # [24]
+
+        x = torch.from_numpy(x).float().unsqueeze(0)                # [1,24,6]
+        y = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1)  # [1,24,1]
+        packed = torch.tensor([base_idx * 100 + sub_id], dtype=torch.long)
+        return x, y, packed
+
+
 def preview_tails_without_building_dataset(
     tails,
     side="PACK2",
