@@ -915,6 +915,88 @@ class Dataset_Forecast24to24_FromSegHead(Dataset):
         return x, y, packed
 
 
+#  =========================================================
+# 回归
+#  =========================================================
+class Dataset_Aligned24to24_Regress_FromSegHead(Dataset):
+    """
+    对齐回归（aligned regression）:
+      X = [ABC(t..t+23)] -> Y = [D(t..t+23)]
+
+    base_dataset: FlightDataset_acm
+      - 每条是 [keep_len, D]，例如 [480, 6]
+
+    输出:
+      x: [1, 24, 5]   (不包含目标列D，等价于mask掉目标变量)
+      y: [1, 24, 1]   (目标列D的同一时刻24点)
+    """
+    def __init__(self, base_dataset: FlightDataset_acm, win_len=24, stride=24):
+        super().__init__()
+        self.base = base_dataset
+        self.win_len = int(win_len)
+        self.stride = int(stride)
+
+        names = getattr(self.base, "feature_names", [])
+        if not names:
+            raise ValueError("base_dataset.feature_names 为空。")
+        n2i = {n: i for i, n in enumerate(names)}
+
+        # 目标 D：你当前任务里 D 就是 PACKx_DISCH_T（和你之前一致）
+        if self.base.side == "PACK1":
+            target_name = "PACK1_DISCH_T"
+            all_names = [
+                "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
+                "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
+            ]
+        else:
+            target_name = "PACK2_DISCH_T"
+            all_names = [
+                "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
+                "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
+            ]
+
+        miss = [c for c in all_names if c not in n2i]
+        if miss:
+            raise ValueError(f"缺列: {miss} | 当前: {names}")
+
+        self.idx_y = n2i[target_name]
+
+        # 输入列 = all_names 去掉 target_name（mask掉目标变量）
+        self.input_names = [c for c in all_names if c != target_name]
+        self.idx_x = [n2i[c] for c in self.input_names]  # 5维
+
+        # base_len = keep_len
+        if len(self.base) > 0:
+            self.base_len = int(self.base.data.shape[1])
+        else:
+            self.base_len = self.win_len
+
+        if self.base_len < self.win_len:
+            raise ValueError(f"base_len={self.base_len} < win_len={self.win_len}")
+
+        # 一个 seghead 能切出多少个窗口
+        self.n_sub = 1 + (self.base_len - self.win_len) // self.stride
+
+    def __len__(self):
+        return len(self.base) * self.n_sub
+
+    def __getitem__(self, idx):
+        base_idx = idx // self.n_sub
+        sub_id = idx % self.n_sub
+        st = sub_id * self.stride
+
+        arr = self.base[base_idx]  # [base_len, D]
+        x = arr[st:st + self.win_len, self.idx_x]          # [24,5]
+        y = arr[st:st + self.win_len, self.idx_y]          # [24]
+
+        x = torch.from_numpy(x).float().unsqueeze(0)                # [1,24,5]
+        y = torch.from_numpy(y).float().unsqueeze(0).unsqueeze(-1)  # [1,24,1]
+
+        packed = torch.tensor([base_idx * 100 + sub_id], dtype=torch.long)
+        return x, y, packed
+
+
+
 # =========================================================
 # 11) 轻量预览 main（可选）
 # =========================================================
