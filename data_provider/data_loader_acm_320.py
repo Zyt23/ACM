@@ -870,13 +870,13 @@ class Dataset_Forecast24to24_FromSegHead(Dataset):
                 "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
                 "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
             ]
-            target_name = "PACK1_DISCH_T"
+            target_name = "PACK1_COMPR_T"
         else:
             self.input_names = [
                 "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
                 "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
             ]
-            target_name = "PACK2_DISCH_T"
+            target_name = "PACK2_COMPR_T"
 
         miss = [c for c in (self.input_names + [target_name]) if c not in n2i]
         if miss:
@@ -918,17 +918,13 @@ class Dataset_Forecast24to24_FromSegHead(Dataset):
 #  =========================================================
 # 回归
 #  =========================================================
-class Dataset_Aligned24to24_Regress_FromSegHead(Dataset):
+class Dataset_AlignedRegress_FromSegHead(Dataset):
     """
     对齐回归（aligned regression）:
-      X = [ABC(t..t+23)] -> Y = [D(t..t+23)]
-
-    base_dataset: FlightDataset_acm
-      - 每条是 [keep_len, D]，例如 [480, 6]
-
+      X = [ABC(t..t+L-1)] -> Y = [D(t..t+L-1)]
     输出:
-      x: [1, 24, 5]   (不包含目标列D，等价于mask掉目标变量)
-      y: [1, 24, 1]   (目标列D的同一时刻24点)
+      x: [1, L, 5]   (mask 掉 D)
+      y: [1, L, 1]
     """
     def __init__(self, base_dataset: FlightDataset_acm, win_len=24, stride=24):
         super().__init__()
@@ -943,13 +939,13 @@ class Dataset_Aligned24to24_Regress_FromSegHead(Dataset):
 
         # 目标 D：你当前任务里 D 就是 PACKx_DISCH_T（和你之前一致）
         if self.base.side == "PACK1":
-            target_name = "PACK1_DISCH_T"
+            target_name = "PACK1_COMPR_T"
             all_names = [
                 "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
                 "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
             ]
         else:
-            target_name = "PACK2_DISCH_T"
+            target_name = "PACK2_COMPR_T"
             all_names = [
                 "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
                 "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
