@@ -991,6 +991,124 @@ class Dataset_AlignedRegress_FromSegHead(Dataset):
         packed = torch.tensor([base_idx * 100 + sub_id], dtype=torch.long)
         return x, y, packed
 
+# =========================================================
+# 12) 96-step "partial target history + full covariates" -> future target
+#     X: covariates(96) + D_past(48) + D_future_masked(48)  ==> Y: D_future(48)
+# =========================================================
+class Dataset_PartialTargetHistory_Regress_FromSegHead(Dataset):
+    """
+    任务定义（以窗口起点为 t）:
+      - 总窗口长度 win_len = 96
+      - 目标变量 D = PACKx_COMPR_T
+      - 协变量 = 其余 5 个变量（与 D 同侧）
+      - 输入给模型：
+          covariates: 96 个时刻全部给
+          target D: 只给前 hist_len=48 个时刻真值
+                   后 fut_len=48 个时刻用 mask_value 代替（默认 0.0）
+        ==> x shape: [1, 96, 6]  (如果 include_mask_channel=True 则 [1,96,7])
+      - 输出监督：
+          y = D 的后 48 个时刻
+        ==> y shape: [1, 48, 1]
+
+    base_dataset: FlightDataset_acm
+      - base[i] = [keep_len, 6]
+    """
+    def __init__(
+        self,
+        base_dataset: FlightDataset_acm,
+        win_len: int = 96,
+        hist_len: int = 48,
+        fut_len: int = 48,
+        stride: int = 96,
+        mask_value: float = 0.0,
+        include_mask_channel: bool = False,
+    ):
+        super().__init__()
+        self.base = base_dataset
+
+        self.win_len = int(win_len)
+        self.hist_len = int(hist_len)
+        self.fut_len = int(fut_len)
+        self.stride = int(stride)
+        self.mask_value = float(mask_value)
+        self.include_mask_channel = bool(include_mask_channel)
+
+        if self.win_len != (self.hist_len + self.fut_len):
+            raise ValueError(
+                f"win_len must equal hist_len+fut_len, got {self.win_len} vs {self.hist_len}+{self.fut_len}"
+            )
+
+        names = getattr(self.base, "feature_names", [])
+        if not names:
+            raise ValueError("base_dataset.feature_names 为空。")
+        n2i = {n: i for i, n in enumerate(names)}
+
+        # 固定列集合（与 FlightDataset_acm 的 para 一致）
+        if self.base.side == "PACK1":
+            all_names = [
+                "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
+                "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
+            ]
+            self.target_name = "PACK1_COMPR_T"
+        else:
+            all_names = [
+                "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
+                "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
+            ]
+            self.target_name = "PACK2_COMPR_T"
+
+        miss = [c for c in all_names if c not in n2i]
+        if miss:
+            raise ValueError(f"缺列: {miss} | 当前 feature_names={names}")
+
+        # 这 6 列（含目标列）
+        self.idx_all = [n2i[c] for c in all_names]
+        # 目标列在原 seg 的列 index（0~5 对应原 feature_names）
+        self.idx_d = n2i[self.target_name]
+        # 目标列在 win（6列）里的位置（0~5）
+        self.idx_d_in_win = self.idx_all.index(self.idx_d)
+
+        # base_len = keep_len
+        if len(self.base) > 0:
+            self.base_len = int(self.base.data.shape[1])
+        else:
+            self.base_len = self.win_len
+
+        if self.base_len < self.win_len:
+            raise ValueError(f"base_len={self.base_len} < win_len={self.win_len}")
+
+        # 一个 seghead 能切出多少个窗口
+        self.n_sub = 1 + (self.base_len - self.win_len) // self.stride
+
+    def __len__(self):
+        return len(self.base) * self.n_sub
+
+    def __getitem__(self, idx):
+        base_idx = idx // self.n_sub
+        sub_id = idx % self.n_sub
+        st = sub_id * self.stride
+
+        seg = self.base[base_idx]  # [base_len, 6]
+        win = seg[st:st + self.win_len, self.idx_all].astype(np.float32)  # [96,6]
+
+        # y: 目标(COMPR_T)的未来 48
+        d_future = win[self.hist_len:self.hist_len + self.fut_len, self.idx_d_in_win].astype(np.float32)  # [48]
+
+        # x: 全量协变量 + 目标前48真值 + 目标后48 mask
+        x = win.copy()
+        x[self.hist_len:, self.idx_d_in_win] = self.mask_value
+
+        if self.include_mask_channel:
+            m = np.ones((self.win_len, 1), dtype=np.float32)
+            m[self.hist_len:, 0] = 0.0
+            x = np.concatenate([x, m], axis=1)  # [96,7]
+
+        x_t = torch.from_numpy(x).float().unsqueeze(0)                       # [1,96,6(or7)]
+        y_t = torch.from_numpy(d_future).float().unsqueeze(0).unsqueeze(-1)  # [1,48,1]
+
+        packed = torch.tensor([base_idx * 100 + sub_id], dtype=torch.long)
+        return x_t, y_t, packed
+
 
 
 # =========================================================

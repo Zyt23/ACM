@@ -1,18 +1,21 @@
-# exp/new_320_acm_regress_multi.py
+# exp/acm_regress_partialD_96_48to48.py
 # -*- coding: utf-8 -*-
 """
-Aligned regression (same-time regression):
-  X = [ABC(t..t+L-1)] -> Y = [D(t..t+L-1)]
-Where D = PACKx_DISCH_T, and ABC = all other 5 variables (mask D).
+Partial target history regression (96-step window):
+  - covariates(5) for all 96 steps
+  - target D = PACKx_COMPR_T for first 48 steps
+  - target D masked for last 48 steps
+Predict:
+  - target D (PACKx_COMPR_T) for last 48 steps
 
-This script runs multiple window lengths (e.g., 48, 96) in a loop.
+Wrapper output:
+  x: [B, 1, 96, 6(or7)]   (6 = 5 cov + 1 target; 7 if include_mask_channel)
+  y: [B, 1, 48, 1]
+Loss computed only on future 48 steps.
 
-Requirements:
-- data_provider/data_loader_acm_320.py contains:
-  - FlightDataset_acm
-  - Dataset_AlignedRegress_FromSegHead
-    (If your class name is still Dataset_Aligned24to24_Regress_FromSegHead,
-     you can either rename it OR adjust the import below.)
+TimerXL usage kept consistent with your previous scripts:
+  out_all = model(x_seq)
+  pred_all = out_all[:, -1, :].unsqueeze(-1)
 """
 
 import os
@@ -39,9 +42,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data_provider.data_loader_acm_320 import (
     FlightDataset_acm,
-    Dataset_AlignedRegress_FromSegHead,   # <-- make sure this exists
-    # If you haven't renamed yet, comment the above and use:
-    # Dataset_Aligned24to24_Regress_FromSegHead as Dataset_AlignedRegress_FromSegHead,
+    Dataset_PartialTargetHistory_Regress_FromSegHead,
 )
 
 from models.timer_xl import Model as TimerXL
@@ -52,7 +53,7 @@ from models.timer_xl import Model as TimerXL
 # =========================================================
 class TimerXLConfigs:
     def __init__(self, args):
-        self.input_token_len = args.input_token_len  # must == win_len
+        self.input_token_len = args.input_token_len  # must == win_len (96)
         self.d_model = args.d_model
         self.n_heads = args.nhead
         self.e_layers = args.num_layers
@@ -132,10 +133,14 @@ def _save_train_curves(save_dir: str, df: pd.DataFrame, title: str):
 def _build_loaders(args, logger):
     base_all = FlightDataset_acm(args, Tag="train_normal", side=args.side)
 
-    full_ds = Dataset_AlignedRegress_FromSegHead(
-        base_all,
-        win_len=args.win_len,
-        stride=args.stride,
+    full_ds = Dataset_PartialTargetHistory_Regress_FromSegHead(
+        base_dataset=base_all,
+        win_len=args.win_len,       # 96
+        hist_len=args.hist_len,     # 48
+        fut_len=args.fut_len,       # 48
+        stride=args.stride,         # usually 96
+        mask_value=args.mask_value,
+        include_mask_channel=args.include_mask_channel,
     )
 
     n_total = len(full_ds)
@@ -171,10 +176,10 @@ def _build_loaders(args, logger):
         persistent_workers=(args.num_workers > 0),
     )
 
-    base_len = int(base_all.data.shape[1]) if len(base_all) > 0 else -1
-    logger.info("[AlignedReg] win_len=%d | stride=%d | input_token_len=%d",
-                int(args.win_len), int(args.stride), int(args.input_token_len))
-    logger.info("Total train_normal segheads=%d | base_len=%d", len(base_all), base_len)
+    logger.info("[PartialDReg] win_len=%d hist_len=%d fut_len=%d stride=%d input_token_len=%d",
+                int(args.win_len), int(args.hist_len), int(args.fut_len), int(args.stride), int(args.input_token_len))
+    logger.info("mask_value=%.3f include_mask_channel=%s", float(args.mask_value), str(args.include_mask_channel))
+    logger.info("Total train_normal segheads=%d", len(base_all))
     logger.info("Total windows=%d | Train=%d | Val=%d", len(full_ds), len(train_ds), len(val_ds))
     logger.info("Feature names=%s", getattr(base_all, "feature_names", None))
 
@@ -184,7 +189,7 @@ def _build_loaders(args, logger):
 # =========================================================
 # 2) training
 # =========================================================
-def train_timerxl_aligned_regress(args):
+def train_timerxl_partialD_regress(args):
     logger = setup_logger(args.setting)
     device = args.gpu
 
@@ -195,8 +200,8 @@ def train_timerxl_aligned_regress(args):
     os.makedirs(save_dir, exist_ok=True)
 
     best_val = float("inf")
-    best_path = os.path.join(save_dir, f"best_timerxl_regress_win{int(args.win_len)}.pth")
-    final_path = os.path.join(save_dir, f"final_timerxl_regress_win{int(args.win_len)}.pth")
+    best_path = os.path.join(save_dir, "best_timerxl_partialD_96_48to48.pth")
+    final_path = os.path.join(save_dir, "final_timerxl_partialD_96_48to48.pth")
 
     logger.info("========== TRAIN START ==========")
     logger.info("device=%s | batch=%d | epochs=%d", str(device), int(args.batch_size), int(args.train_epochs))
@@ -211,20 +216,24 @@ def train_timerxl_aligned_regress(args):
         tr_sum, tr_n = 0.0, 0
 
         for batch_x, batch_y, _ in train_loader:
-            # batch_x: [B,1,L,5]  batch_y: [B,1,L,1]
+            # batch_x: [B,1,96,6(or7)]  batch_y: [B,1,48,1]
             _, _, L, C = batch_x.shape
-            x = batch_x.to(device).reshape(-1, L, C)     # [B,L,5]
-            y = batch_y.to(device).reshape(-1, L, 1)     # [B,L,1]
+            x = batch_x.to(device).reshape(-1, L, C)              # [B,96,C]
+            y = batch_y.to(device).reshape(-1, args.fut_len, 1)   # [B,48,1]
 
             out_all = model(x)
-            pred = out_all[:, -1, :].unsqueeze(-1)       # [B,L,1] (keep your TimerXL usage)
+            pred_all = out_all[:, -1, :].unsqueeze(-1)            # expect [B,96,1]
+            assert pred_all.shape[1] == args.win_len, f"pred_all time dim != win_len: {pred_all.shape}"
+
+            pred_fut = pred_all[:, args.hist_len: args.hist_len + args.fut_len, :]  # [B,48,1]
 
             if (not printed_shape) and bool(getattr(args, "debug_print_shapes", True)):
-                logger.info("[Shape] x=%s y=%s out_all=%s pred=%s",
-                            tuple(x.shape), tuple(y.shape), tuple(out_all.shape), tuple(pred.shape))
+                logger.info("[Shape] x=%s y=%s out_all=%s pred_all=%s pred_fut=%s",
+                            tuple(x.shape), tuple(y.shape), tuple(out_all.shape),
+                            tuple(pred_all.shape), tuple(pred_fut.shape))
                 printed_shape = True
 
-            loss = criterion(pred, y)
+            loss = criterion(pred_fut, y)
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -242,11 +251,14 @@ def train_timerxl_aligned_regress(args):
             for batch_x, batch_y, _ in val_loader:
                 _, _, L, C = batch_x.shape
                 x = batch_x.to(device).reshape(-1, L, C)
-                y = batch_y.to(device).reshape(-1, L, 1)
+                y = batch_y.to(device).reshape(-1, args.fut_len, 1)
 
                 out_all = model(x)
-                pred = out_all[:, -1, :].unsqueeze(-1)
-                loss = criterion(pred, y)
+                pred_all = out_all[:, -1, :].unsqueeze(-1)
+                assert pred_all.shape[1] == args.win_len, f"pred_all time dim != win_len: {pred_all.shape}"
+
+                pred_fut = pred_all[:, args.hist_len: args.hist_len + args.fut_len, :]
+                loss = criterion(pred_fut, y)
 
                 bsz = x.size(0)
                 va_sum += float(loss.item()) * bsz
@@ -286,19 +298,14 @@ def train_timerxl_aligned_regress(args):
 
 
 # =========================================================
-# 3) evaluation: per-flight / per-tail
+# 3) evaluation: per-flight / per-tail (future-48 MSE)
 # =========================================================
 @torch.no_grad()
-def evaluate_by_flight_and_tail_aligned_regress(args, ckpt_path, tag: str):
-    """
-    aligned regression:
-      X: [ABC(t..t+L-1)] -> Y: [D(t..t+L-1)]
-    Output per-flight and per-tail MSE.
-    """
+def evaluate_by_flight_and_tail_partialD(args, ckpt_path, tag: str):
     logger = setup_logger(args.setting + f"_{tag}_eval")
     device = args.gpu
 
-    logger.info("========== AlignedReg flight eval (%s) ==========", tag)
+    logger.info("========== PartialD future-48 eval (%s) ==========", tag)
 
     base_ds = FlightDataset_acm(args, Tag=tag, side=args.side)
     if len(base_ds) == 0:
@@ -310,96 +317,82 @@ def evaluate_by_flight_and_tail_aligned_regress(args, ckpt_path, tag: str):
     model.load_state_dict(state)
     model.eval()
 
-    win_len = int(args.win_len)
-    stride = int(args.stride)
+    eval_ds = Dataset_PartialTargetHistory_Regress_FromSegHead(
+        base_dataset=base_ds,
+        win_len=args.win_len,
+        hist_len=args.hist_len,
+        fut_len=args.fut_len,
+        stride=args.stride,
+        mask_value=args.mask_value,
+        include_mask_channel=args.include_mask_channel,
+    )
 
-    feature_names = getattr(base_ds, "feature_names", [])
-    if not feature_names:
-        raise RuntimeError("base_ds.feature_names is empty.")
-    n2i = {n: i for i, n in enumerate(feature_names)}
-
-    # D = PACKx_DISCH_T (target); inputs = other 5 variables (mask D)
-    if args.side == "PACK1":
-        target_name = "PACK1_COMPR_T"
-        all_names = [
-            "PACK1_BYPASS_V", "PACK1_DISCH_T", "PACK1_RAM_I_DR",
-            "PACK1_RAM_O_DR", "PACK_FLOW_R1", "PACK1_COMPR_T",
-        ]
-    else:
-        target_name = "PACK2_COMPR_T"
-        all_names = [
-            "PACK2_BYPASS_V", "PACK2_DISCH_T", "PACK2_RAM_I_DR",
-            "PACK2_RAM_O_DR", "PACK_FLOW_R2", "PACK2_COMPR_T",
-        ]
-
-    miss = [c for c in all_names if c not in n2i]
-    if miss:
-        raise RuntimeError(f"[{tag}] missing columns: {miss} | feature_names={feature_names}")
-
-    idx_y = n2i[target_name]
-    input_names = [c for c in all_names if c != target_name]
-    idx_x = [n2i[c] for c in input_names]
-
-    flight_rows = []
+    flight2losses = {}
     tail2losses = {}
 
-    for i in tqdm(range(len(base_ds)), desc=f"[{tag}] aligned regress eval"):
-        seg = base_ds.data[i]  # [keep_len, D]
-        tail = base_ds.window_tails[i] if hasattr(base_ds, "window_tails") else "UNKNOWN"
-        seg_start = base_ds.window_start_times[i] if hasattr(base_ds, "window_start_times") else "UNKNOWN"
+    loader = DataLoader(
+        eval_ds,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(args.num_workers > 0),
+    )
 
-        keep_len = int(seg.shape[0])
-        if keep_len < win_len:
-            continue
+    for batch_x, batch_y, packed in tqdm(loader, desc=f"[{tag}] eval batches"):
+        _, _, L, C = batch_x.shape
+        x = batch_x.to(device).reshape(-1, L, C)              # [B,96,C]
+        y = batch_y.to(device).reshape(-1, args.fut_len, 1)   # [B,48,1]
 
-        xs, ys = [], []
-        for st in range(0, keep_len - win_len + 1, stride):
-            xs.append(seg[st:st + win_len, idx_x])   # [L,5]
-            ys.append(seg[st:st + win_len, idx_y])   # [L]
+        out_all = model(x)
+        pred_all = out_all[:, -1, :].unsqueeze(-1)            # [B,96,1]
+        assert pred_all.shape[1] == args.win_len, f"pred_all time dim != win_len: {pred_all.shape}"
 
-        if not xs:
-            continue
+        pred_fut = pred_all[:, args.hist_len: args.hist_len + args.fut_len, :]  # [B,48,1]
 
-        x_t = torch.from_numpy(np.stack(xs)).float().to(device)                 # [N,L,5]
-        y_t = torch.from_numpy(np.stack(ys)).float().unsqueeze(-1).to(device)  # [N,L,1]
+        mse_each = ((pred_fut - y) ** 2).mean(dim=(1, 2)).detach().cpu().numpy()
+        packed = packed.detach().cpu().numpy().astype(int)
 
-        out_all = model(x_t)
-        pred = out_all[:, -1, :].unsqueeze(-1)                                  # [N,L,1]
+        for i in range(len(mse_each)):
+            base_idx = int(packed[i] // 100)
+            loss_i = float(mse_each[i])
 
-        losses = ((pred - y_t) ** 2).mean(dim=(1, 2)).detach().cpu().numpy()    # [N]
-        flight_mse = float(losses.mean())
+            flight2losses.setdefault(base_idx, []).append(loss_i)
 
+            tail = base_ds.window_tails[base_idx] if hasattr(base_ds, "window_tails") else "UNKNOWN"
+            tail2losses.setdefault(str(tail), []).append(loss_i)
+
+    flight_rows = []
+    for base_idx, losses in flight2losses.items():
+        tail = base_ds.window_tails[base_idx] if hasattr(base_ds, "window_tails") else "UNKNOWN"
+        seg_start = base_ds.window_start_times[base_idx] if hasattr(base_ds, "window_start_times") else "UNKNOWN"
         flight_rows.append({
             "tail": str(tail),
             "seg_start_time": str(seg_start),
-            "flight_index": int(i),
+            "flight_index": int(base_idx),
             "n_windows": int(len(losses)),
-            "flight_mse": flight_mse,
+            "flight_mse_future48": float(np.mean(losses)),
         })
-        tail2losses.setdefault(str(tail), []).append(flight_mse)
-
-        if i % 200 == 0:
-            logger.info("[%s] processed flights %d / %d", tag, i, len(base_ds))
-
-    out_dir = os.path.join(
-        args.checkpoints,
-        args.setting,
-        "test_results_aligned_regress",
-        f"win{int(args.win_len)}",
-        tag
-    )
-    os.makedirs(out_dir, exist_ok=True)
 
     df_flight = pd.DataFrame(flight_rows)
     if not df_flight.empty:
         df_flight = df_flight.sort_values(["tail", "seg_start_time"], ascending=True)
 
     df_tail = pd.DataFrame([
-        {"tail": t, "n_flights": int(len(v)), "avg_flight_mse": float(np.mean(v))}
+        {"tail": t, "n_windows": int(len(v)), "avg_mse_future48": float(np.mean(v))}
         for t, v in tail2losses.items()
     ])
     if not df_tail.empty:
-        df_tail = df_tail.sort_values(["avg_flight_mse"], ascending=True)
+        df_tail = df_tail.sort_values(["avg_mse_future48"], ascending=True)
+
+    out_dir = os.path.join(
+        args.checkpoints,
+        args.setting,
+        "test_results_partialD_96_48to48",
+        tag
+    )
+    os.makedirs(out_dir, exist_ok=True)
 
     flight_csv = os.path.join(out_dir, f"{tag}_per_flight.csv")
     tail_csv = os.path.join(out_dir, f"{tag}_per_tail.csv")
@@ -408,14 +401,12 @@ def evaluate_by_flight_and_tail_aligned_regress(args, ckpt_path, tag: str):
 
     logger.info("[%s] saved per-flight -> %s", tag, flight_csv)
     logger.info("[%s] saved per-tail   -> %s", tag, tail_csv)
-    logger.info("[%s] flights=%d | tails=%d", tag, len(df_flight), len(df_tail))
 
     if not df_flight.empty:
-        logger.info("[%s] overall mean flight_mse=%.6f", tag, float(df_flight["flight_mse"].mean()))
+        logger.info("[%s] overall mean flight_mse_future48=%.6f", tag, float(df_flight["flight_mse_future48"].mean()))
     if not df_tail.empty:
-        logger.info("[%s] overall mean tail avg_flight_mse=%.6f", tag, float(df_tail["avg_flight_mse"].mean()))
+        logger.info("[%s] overall mean tail avg_mse_future48=%.6f", tag, float(df_tail["avg_mse_future48"].mean()))
 
-    logger.info("========== DONE (%s) ==========", tag)
     return df_flight, df_tail
 
 
@@ -433,10 +424,21 @@ if __name__ == "__main__":
     base_args.seq_len = 96
     base_args.max_windows_per_flight = 10
 
+    # task window
+    base_args.win_len = 96
+    base_args.hist_len = 48
+    base_args.fut_len = 48
+    base_args.stride = 96
+
+    # masking
+    base_args.mask_value = 0.0
+    base_args.include_mask_channel = True  # 建议 True
+
     # device
     base_args.gpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # TimerXL
+    base_args.input_token_len = 96
     base_args.d_model = 128
     base_args.nhead = 4
     base_args.num_layers = 3
@@ -445,6 +447,7 @@ if __name__ == "__main__":
 
     # Train
     base_args.batch_size = 256
+    base_args.eval_batch_size = 256
     base_args.num_workers = 4
     base_args.learning_rate = 3e-4
     base_args.weight_decay = 1e-4
@@ -466,7 +469,7 @@ if __name__ == "__main__":
     base_args.normal_anchor_end = "2025-08-01"
 
     # raw cache
-    base_args.raw_months = 24
+    base_args.raw_months = 12
     base_args.raw_end_use_gap = False
 
     # verbose
@@ -477,54 +480,42 @@ if __name__ == "__main__":
     # debug prints
     base_args.debug_print_shapes = True
 
-    # choose window lengths to run
-    win_list = [24]
-
+    mask_flag = 1 if base_args.include_mask_channel else 0
     base_setting = (
-        f"timerxl_aligned_regress_"
+        f"timerxl_partialD96_hist48_fut48_"
         f"keep{base_args.max_windows_per_flight}x{base_args.seq_len}_"
+        f"stride{base_args.stride}_mask{mask_flag}_"
         f"raw{base_args.raw_months}m_train{base_args.normal_months}m_test{base_args.test_normal_months}m_"
         f"gap{base_args.fault_gap_months}m_{base_args.normal_anchor_end}end_noALTSTD"
     )
 
-    # Keep same behavior as your previous scripts
-    for side in ["PACK2","PACK1"]:
-        for L in win_list:
-            args = Args()
-            args.__dict__.update(base_args.__dict__)
+    for side in ["PACK2", "PACK1"]:
+        args = Args()
+        args.__dict__.update(base_args.__dict__)
+        args.side = side
+        args.setting = f"{base_setting}_{side}"
 
-            args.side = side
-            args.win_len = int(L)
+        save_dir = os.path.join(args.checkpoints, args.setting)
+        os.makedirs(save_dir, exist_ok=True)
+        best_ckpt = os.path.join(save_dir, "best_timerxl_partialD_96_48to48.pth")
 
-            # IMPORTANT:
-            # - input_token_len must equal win_len
-            # - stride should normally equal win_len to avoid exploding sample count
-            args.input_token_len = int(L)
-            args.stride = int(L)
+        print("\n==============================")
+        print(
+            f"Running side={side} | setting={args.setting}\n"
+            f"  keep={args.max_windows_per_flight}x{args.seq_len}\n"
+            f"  task: win_len={args.win_len}, hist_len={args.hist_len}, fut_len={args.fut_len}, stride={args.stride}\n"
+            f"  include_mask_channel={args.include_mask_channel}, mask_value={args.mask_value}\n"
+            f"  rawM={args.raw_months} trainM={args.normal_months} testM={args.test_normal_months} "
+            f"gapM={args.fault_gap_months} anchor_end={args.normal_anchor_end}\n"
+            f"  ckpt={best_ckpt}"
+        )
+        print("==============================")
 
-            args.setting = f"{base_setting}_win{args.win_len}_stride{args.stride}_{side}"
+        if not os.path.exists(best_ckpt):
+            best_ckpt = train_timerxl_partialD_regress(args)
 
-            save_dir = os.path.join(args.checkpoints, args.setting)
-            os.makedirs(save_dir, exist_ok=True)
-
-            best_ckpt = os.path.join(save_dir, f"best_timerxl_regress_win{args.win_len}.pth")
-
-            print("\n==============================")
-            print(
-                f"Running side={side} | setting={args.setting}\n"
-                f"  keep={args.max_windows_per_flight}x{args.seq_len}\n"
-                f"  aligned_regress: win_len={args.win_len} stride={args.stride}\n"
-                f"  rawM={args.raw_months} trainM={args.normal_months} testM={args.test_normal_months} "
-                f"gapM={args.fault_gap_months} anchor_end={args.normal_anchor_end}\n"
-                f"  ckpt={best_ckpt}"
-            )
-            print("==============================")
-
-            if not os.path.exists(best_ckpt):
-                best_ckpt = train_timerxl_aligned_regress(args)
-
-            if os.path.exists(best_ckpt):
-                evaluate_by_flight_and_tail_aligned_regress(args, ckpt_path=best_ckpt, tag="test_normal_recent")
-                evaluate_by_flight_and_tail_aligned_regress(args, ckpt_path=best_ckpt, tag="test_abnormal")
-            else:
-                print("[ERROR] best checkpoint not found:", best_ckpt)
+        if os.path.exists(best_ckpt):
+            evaluate_by_flight_and_tail_partialD(args, ckpt_path=best_ckpt, tag="test_normal_recent")
+            evaluate_by_flight_and_tail_partialD(args, ckpt_path=best_ckpt, tag="test_abnormal")
+        else:
+            print("[ERROR] best checkpoint not found:", best_ckpt)
