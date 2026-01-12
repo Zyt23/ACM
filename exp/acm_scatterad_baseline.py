@@ -4,7 +4,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Dict
 
 import numpy as np
 import pandas as pd
@@ -62,6 +62,8 @@ def eval_scores_per_flight(
     stride: int,
     device,
     agg: str = "max",
+    batch_size: int = 256,
+    num_workers: int = 2,
 ) -> pd.DataFrame:
     """
     Compute per-flight (per seghead) anomaly score.
@@ -69,7 +71,7 @@ def eval_scores_per_flight(
     """
     model.eval()
     ds = WindowFromSegHead(base_ds, win_len=win_len, stride=stride)
-    loader = DataLoader(ds, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     # collect window scores per base_idx
     flight_scores: Dict[int, List[float]] = {}
@@ -108,6 +110,35 @@ def eval_scores_per_flight(
     return df
 
 
+@torch.no_grad()
+def eval_mean_window_loss(
+    model: ScatterAD,
+    base_ds: FlightDataset_acm,
+    win_len: int,
+    stride: int,
+    device,
+    batch_size: int = 256,
+    num_workers: int = 2,
+) -> float:
+    """
+    计算某个 Tag 数据集的 window-level mean loss（用于看 test loss 水平）
+    """
+    model.eval()
+    ds = WindowFromSegHead(base_ds, win_len=win_len, stride=stride)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+    loss_sum, n = 0.0, 0
+    for x, _ in tqdm(loader, desc="Eval mean window loss"):
+        x = x.to(device)
+        out = model(x)  # forward 才会产生 loss
+        loss = out["loss"]
+        bsz = x.size(0)
+        loss_sum += float(loss.item()) * bsz
+        n += bsz
+
+    return loss_sum / max(1, n)
+
+
 def alarm_by_tail_trend(df_flight: pd.DataFrame, thr: float, k: int = 3) -> pd.DataFrame:
     """
     你的逻辑：持续上升 or 短期高于阈值报警
@@ -139,6 +170,106 @@ def alarm_by_tail_trend(df_flight: pd.DataFrame, thr: float, k: int = 3) -> pd.D
 def train_scatterad_baseline(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    save_dir = os.path.join(args.checkpoints, args.setting)
+    os.makedirs(save_dir, exist_ok=True)
+    best_path = os.path.join(save_dir, "best_scatterad_baseline.pth")
+    final_path = os.path.join(save_dir, "final_scatterad_baseline.pth")
+    loss_curve_path = os.path.join(save_dir, "loss_curve.csv")
+
+    # ===== Eval-only shortcut: if eval_only=True OR checkpoint exists, skip training =====
+    if args.eval_only or os.path.exists(best_path):
+        if not os.path.exists(best_path):
+            raise RuntimeError(f"eval_only=True but checkpoint not found: {best_path}")
+
+        print(f"[EvalOnly] Found checkpoint: {best_path}")
+        print("[EvalOnly] Skip training and run evaluation directly.")
+
+        # build train_base only for dim inference & threshold
+        train_base = FlightDataset_acm(args, Tag="train_normal", side=args.side)
+        D = int(train_base.data.shape[2])
+
+        model = ScatterAD(
+            in_dim=D,
+            hid_dim=args.hid_dim,
+            tau=args.tau,
+            gat_layers=args.gat_layers,
+            temp=args.temp,
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=args.gamma,
+            center_momentum=args.center_momentum,
+            dropout=args.dropout,
+        ).to(device)
+
+        model.load_state_dict(torch.load(best_path, map_location=device))
+        model.eval()
+
+        # ===== test mean window loss (what you want to see first) =====
+        print("\n===== Test mean window loss (window-level) =====")
+        for tag in ["test_normal_recent", "test_abnormal"]:
+            base = FlightDataset_acm(args, Tag=tag, side=args.side)
+            if len(base) == 0:
+                print(f"[WARN] {tag} dataset empty, skip loss eval.")
+                continue
+            mloss = eval_mean_window_loss(
+                model,
+                base,
+                win_len=args.win_len,
+                stride=args.stride,
+                device=device,
+                batch_size=args.batch_size,
+                num_workers=2,
+            )
+            print(f"[{tag}] mean_window_loss = {mloss:.6f}")
+
+        # ===== threshold from train_normal flight scores =====
+        df_train_score = eval_scores_per_flight(
+            model,
+            train_base,
+            win_len=args.win_len,
+            stride=args.stride,
+            device=device,
+            agg=args.agg,
+            batch_size=args.batch_size,
+            num_workers=2,
+        )
+        if df_train_score.empty:
+            raise RuntimeError("df_train_score empty, cannot compute threshold.")
+        thr = float(np.quantile(df_train_score["flight_score"].values, args.thr_q))
+        print(f"\nThreshold (quantile={args.thr_q} on train_normal flight_score): thr={thr:.6f}")
+
+        # ===== eval test per-flight scores & alarms =====
+        for tag in ["test_normal_recent", "test_abnormal"]:
+            base = FlightDataset_acm(args, Tag=tag, side=args.side)
+            if len(base) == 0:
+                print(f"[WARN] {tag} dataset empty, skip score eval.")
+                continue
+
+            df = eval_scores_per_flight(
+                model,
+                base,
+                win_len=args.win_len,
+                stride=args.stride,
+                device=device,
+                agg=args.agg,
+                batch_size=args.batch_size,
+                num_workers=2,
+            )
+            df = alarm_by_tail_trend(df, thr=thr, k=args.trend_k)
+
+            out_dir = os.path.join(save_dir, "results", tag)
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"per_flight_{tag}.csv")
+            df.to_csv(out_path, index=False)
+            print(f"[{tag}] saved:", out_path)
+
+        print("[EvalOnly] Done.")
+        return
+
+    # =========================
+    # ===== Training branch ===
+    # =========================
+
     # 1) datasets (reuse your cache)
     train_base = FlightDataset_acm(args, Tag="train_normal", side=args.side)
     full_ds = WindowFromSegHead(train_base, win_len=args.win_len, stride=args.stride)
@@ -151,8 +282,20 @@ def train_scatterad_baseline(args):
     g = torch.Generator().manual_seed(args.split_seed)
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
 
     D = int(train_base.data.shape[2])
     model = ScatterAD(
@@ -170,20 +313,19 @@ def train_scatterad_baseline(args):
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
-    save_dir = os.path.join(args.checkpoints, args.setting)
-    os.makedirs(save_dir, exist_ok=True)
-    best_path = os.path.join(save_dir, "best_scatterad_baseline.pth")
-    final_path = os.path.join(save_dir, "final_scatterad_baseline.pth")
-
     best_val = 1e18
+    loss_log = []
+
     for ep in range(1, args.epochs + 1):
         t0 = time.time()
         model.train()
         tr_sum, tr_n = 0.0, 0
+
         for x, _ in train_loader:
             x = x.to(device)
             out = model(x)
             loss = out["loss"]
+
             optim.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -205,10 +347,14 @@ def train_scatterad_baseline(args):
                 bsz = x.size(0)
                 va_sum += float(loss.item()) * bsz
                 va_n += bsz
+
         val_loss = va_sum / max(1, va_n)
         dt = time.time() - t0
 
         print(f"[Ep {ep}/{args.epochs}] train={train_loss:.6f} val={val_loss:.6f} | {dt:.1f}s")
+
+        loss_log.append({"epoch": ep, "train_loss": train_loss, "val_loss": val_loss})
+        pd.DataFrame(loss_log).to_csv(loss_curve_path, index=False)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -217,29 +363,69 @@ def train_scatterad_baseline(args):
 
     torch.save(model.state_dict(), final_path)
     print("Saved final:", final_path)
+    print("Saved loss curve:", loss_curve_path)
 
     # 2) threshold from train_normal flight scores (quantile)
     model.load_state_dict(torch.load(best_path, map_location=device))
     model.eval()
 
-    df_train_score = eval_scores_per_flight(model, train_base, win_len=args.win_len, stride=args.stride, device=device, agg=args.agg)
+    # ===== 先看测试集 mean window loss =====
+    print("\n===== Test mean window loss (window-level) =====")
+    for tag in ["test_normal_recent", "test_abnormal"]:
+        base = FlightDataset_acm(args, Tag=tag, side=args.side)
+        if len(base) == 0:
+            print(f"[WARN] {tag} dataset empty, skip loss eval.")
+            continue
+        mloss = eval_mean_window_loss(
+            model,
+            base,
+            win_len=args.win_len,
+            stride=args.stride,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=2,
+        )
+        print(f"[{tag}] mean_window_loss = {mloss:.6f}")
+
+    df_train_score = eval_scores_per_flight(
+        model,
+        train_base,
+        win_len=args.win_len,
+        stride=args.stride,
+        device=device,
+        agg=args.agg,
+        batch_size=args.batch_size,
+        num_workers=2,
+    )
     if df_train_score.empty:
         raise RuntimeError("df_train_score empty, cannot compute threshold.")
     thr = float(np.quantile(df_train_score["flight_score"].values, args.thr_q))
+    print(f"\nThreshold (quantile={args.thr_q} on train_normal flight_score): thr={thr:.6f}")
 
-    # 3) eval on recent normal & abnormal
+    # 3) eval on recent normal & abnormal (per-flight)
     for tag in ["test_normal_recent", "test_abnormal"]:
         base = FlightDataset_acm(args, Tag=tag, side=args.side)
         if len(base) == 0:
             print(f"[WARN] {tag} dataset empty, skip.")
             continue
-        df = eval_scores_per_flight(model, base, win_len=args.win_len, stride=args.stride, device=device, agg=args.agg)
+
+        df = eval_scores_per_flight(
+            model,
+            base,
+            win_len=args.win_len,
+            stride=args.stride,
+            device=device,
+            agg=args.agg,
+            batch_size=args.batch_size,
+            num_workers=2,
+        )
         df = alarm_by_tail_trend(df, thr=thr, k=args.trend_k)
 
         out_dir = os.path.join(save_dir, "results", tag)
         os.makedirs(out_dir, exist_ok=True)
-        df.to_csv(os.path.join(out_dir, f"per_flight_{tag}.csv"), index=False)
-        print(f"[{tag}] saved:", os.path.join(out_dir, f"per_flight_{tag}.csv"))
+        out_path = os.path.join(out_dir, f"per_flight_{tag}.csv")
+        df.to_csv(out_path, index=False)
+        print(f"[{tag}] saved:", out_path)
 
     print("Done.")
 
@@ -283,7 +469,7 @@ class Args:
 
     lr: float = 3e-4
     wd: float = 1e-4
-    epochs: int = 30
+    epochs: int = 100
     grad_clip: float = 5.0
 
     agg: str = "max"        # per-flight aggregation: max / mean
@@ -292,6 +478,9 @@ class Args:
 
     checkpoints: str = "./checkpoints"
     setting: str = "scatterad_baseline_acm"
+
+    # ===== new =====
+    eval_only: bool = False   # True: 强制只评估不训练；另外如果 best_path 存在也会自动跳过训练
 
 
 if __name__ == "__main__":

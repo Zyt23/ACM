@@ -397,7 +397,7 @@ class Args:
 
     lr: float = 3e-4
     wd: float = 1e-4
-    epochs: int = 30
+    epochs: int = 100
     grad_clip: float = 5.0
 
     agg: str = "max"
@@ -408,7 +408,11 @@ class Args:
     setting: str = "timerxl_scatter_physics_acm"
 
     # ==== TimerXL checkpoint ====
-    timerxl_ckpt: str = "./checkpoints/your_timerxl_path/best_timerxl_regress_win96.pth"
+    timerxl_ckpt = (
+    "./checkpoints/"
+    "timerxl_aligned_regress_keep5x96_raw12m_train10m_test1m_gap6m_2025-08-01end_noALTSTD_win96_stride96_PACK2/"
+    "best_timerxl_regress_win96.pth"
+    )
 
     # TimerXL cfg object (you can swap to your TimerXLConfigs(args) too)
     timerxl_cfg: TimerXLConfigsLike = TimerXLConfigsLike(input_token_len=96)
