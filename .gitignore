@@ -18,6 +18,9 @@
 !alarm/
 !alarm/**
 
+!models/
+!models/**
+
 # (Optional but common) If you still want to ignore Python caches even inside allowed dirs, uncomment:
 # **/__pycache__/
 # **/*.pyc
